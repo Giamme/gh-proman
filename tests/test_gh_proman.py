@@ -669,6 +669,7 @@ class CreateTests(Case):
         res = self.cj("create", "--type", "bug", "--title", "Login Google resta in attesa", "--body", self.BODY,
                       "--priority", "P1", "--confirm-new")
         self.assertEqual(res["ref"], "o/r#12")
+        self.assertEqual(res["title"], "[P1] Login Google resta in attesa")
         self.assertEqual(res["lint_warnings"], [])
 
     def test_create_sets_board_fields_title_and_parent(self):
@@ -750,6 +751,9 @@ class CreateTests(Case):
         self.cj("set-priority", "--issue", "o/r#1", "--priority", "P0")
         self.assertEqual(self.issue(1)["title"], "[S03 · P0] Scadenze")
         self.assertEqual(self.item("o/r#1")["fields"]["Priority"], "P0")
+        self.add_issue(2, "[P2] Login")
+        self.cj("set-priority", "--issue", "o/r#2", "--priority", "P1")
+        self.assertEqual(self.issue(2)["title"], "[P1] Login")
 
     def test_project_setup_adds_missing_options_and_keeps_ids(self):
         self.cj("project", "setup")
@@ -897,13 +901,13 @@ class FindingsTests(Case):
         self.assertEqual(len(created), 3)
         issues = self.load()["repos"]["o/r"]["issues"]
         bodies = {i["title"]: i["body"] for i in issues.values()}
-        body = bodies["company-import.ts: Company creation occurs before replaying the profile receipt, allowing an "
+        body = bodies["[P2] company-import.ts: Company creation occurs before replaying the profile receipt, allowing an "
                       "unchanged…"]
         self.assertIn("sotto la soglia bloccante P1", body)
         self.assertIn("review di `sol:xhigh:codex`", body)
         self.assertIn(f"https://github.com/o/r/blob/{self.sha}/src/lib/crm/company-import.ts#L645", body)
         self.assertRegex(body, r"<!-- gh-proman:finding fp=[0-9a-f]{12} source=forge:plan/import -->")
-        self.assertIn("Da verificare: lead.ts: Lead names may keep trailing spaces", bodies)
+        self.assertIn("[P3] Da verificare: lead.ts: Lead names may keep trailing spaces", bodies)
         prio = {i["title"]: self.item(f"o/r#{i['number']}")["fields"].get("Priority") for i in issues.values()}
         self.assertEqual(sorted(prio.values()), ["P2", "P3", "P3"])
         again = self.cj("findings", "--from", str(self.plan), "--include-plausible", "--apply")

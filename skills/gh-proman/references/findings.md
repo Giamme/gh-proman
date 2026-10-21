@@ -17,7 +17,7 @@ A task's findings are used only when it passed (`PASS`, or `MERGED` in `results.
 
 ## What an issue looks like
 
-- **Title:** `<file>: <first sentence of the finding>`, cut at about 90 characters. PLAUSIBLE ones start with `Da verificare:` / `To verify:`.
+- **Title:** `[Pn] <file>: <first sentence of the finding>`, cut at about 90 characters before the prefix. PLAUSIBLE ones start with `Da verificare:` / `To verify:`.
 - **Type:** Bug.
 - **Priority:** the forge severity. P0–P3 map straight onto gh-proman's levels, and onto the org's Urgent…Low where Priority is an organisation issue field.
 - **Body:** the bug template in the config language:

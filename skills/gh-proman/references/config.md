@@ -26,7 +26,8 @@ When both exist, the repo file is merged over the matched profile, key by key. `
 | `priority.source` | `auto` | `auto`: the organisation's issue field named `priority.field` if there is one, else the board's project field. `issue` / `project` force one |
 | `priority.map` | `{}` | Level → option name, e.g. `{"P0": "Urgent"}`. Without it, an option named like the level is used, else the standard names by position (Urgent/Critical, High, Medium/Normal, Low) |
 | `issue_types` | bug→Bug, feature→Feature, chore→Task | Organisation issue type set by `create`; skipped with a warning if the org has no such type |
-| `title_format` | `[{id} · {priority}] {title}` | Title when `create --id` is given; without an ID the title is used as is |
+| `title_format` | `[{id} · {priority}] {title}` | Title when `create --id` is given |
+| `plain_title_format` | `[{priority}] {title}` | Title without an ID. A title that already starts with `[` is kept as is; `""` turns the prefix off |
 | `task_id_pattern` | `\b[A-Z]\d{2}(?:\.\d+)?\b` | Task IDs (`S03`, `T01.2`) recognised in titles, branches and commits |
 | `status_block_position` | `top` | Where a new status block goes in an issue body (`top` / `bottom`) |
 | `duplicate_threshold` | `0.5` | Score at which `create` stops and shows possible duplicates |

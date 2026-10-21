@@ -49,7 +49,7 @@ Then run `config show` to learn the board, the language and the integration bran
 ## Create an issue
 
 1. Pick the type (`bug`, `feature`, `chore`) and read `assets/templates/<language>/<type>.md`. Fill every section and drop the `<!-- hints -->`. `references/issue-writing.md` covers:
-   - titles, including the `[ID · Pn]` prefix for planned tasks;
+   - titles, including the prefix `create` adds: `[ID · Pn]` for planned tasks, `[Pn]` otherwise;
    - how concrete the checklists should be;
    - the house style already used on the board.
 2. Link code with `permalink <path>[:line[-line]]`. It refuses unpushed SHAs, and branch links rot. Link related issues as `Refs owner/repo#N`.

@@ -29,8 +29,9 @@ Don't pad: three sharp criteria beat ten vague ones. Don't tick boxes in someone
 
 ## Titles
 
-- Plain issues: an imperative or a symptom, under about 70 characters. "Login con Google resta in attesa dopo il consenso", "Esporta i report in CSV".
-- Planned tasks with an ID: `create --id S03 --priority P0` produces `[S03 · P0] <title>`, matching the board's existing tasks. `set-priority` keeps the prefix in sync with the Priority field.
+- Every title starts with a bracketed prefix, like the board's existing tasks. Pass the bare title; `create` adds the prefix, and `set-priority` keeps it in sync with the Priority field.
+- Plain issues: an imperative or a symptom, under about 70 characters. `create --priority P1` produces `[P1] Login con Google resta in attesa dopo il consenso`. Don't repeat the priority in the title text.
+- Planned tasks with an ID: `create --id S03 --priority P0` produces `[S03 · P0] <title>`.
 - Bugs say where: "Drawer Fascicolo: le schede non si ripristinano".
 
 ## References

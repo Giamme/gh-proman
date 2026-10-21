@@ -306,6 +306,7 @@ DEFAULTS = {
                  "map": {}},
     "issue_types": {"bug": "Bug", "feature": "Feature", "chore": "Task"},
     "title_format": "[{id} · {priority}] {title}",
+    "plain_title_format": "[{priority}] {title}",
     "task_id_pattern": r"\b[A-Z]\d{2}(?:\.\d+)?\b",
     "status_block_position": "top",
     "duplicate_threshold": 0.5,
@@ -1315,7 +1316,7 @@ def set_priority(ctx, ref, priority):
         item_id = ctx.project().add(issue["id"])
     applied = apply_priority(ctx, ref.slug, issue["id"], item_id, priority)
     title = issue["title"]
-    new_title = re.sub(r"^(\[[^\]·]+·\s*)P\d(\s*\])", lambda m: m.group(1) + priority + m.group(2), title)
+    new_title = re.sub(r"^(\[(?:[^\]·]+·\s*)?)P\d(\s*\])", lambda m: m.group(1) + priority + m.group(2), title)
     if new_title != title:
         ctx.count()
         ctx.gh.rest(f"repos/{ref.slug}/issues/{ref.number}", "PATCH", {"title": new_title})
@@ -1758,6 +1759,8 @@ def cmd_candidates(ctx, args):
 def format_title(cfg, title, priority, task_id):
     if task_id:
         return cfg["title_format"].format(id=task_id, priority=priority, title=title)
+    if cfg.get("plain_title_format") and not title.lstrip().startswith("["):  # keep a prefix the caller wrote
+        return cfg["plain_title_format"].format(priority=priority, title=title)
     return title
 
 
