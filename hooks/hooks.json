@@ -1,0 +1,28 @@
+{
+  "description": "gh-proman: after an agent creates an issue or PR, or merges a PR, ask it to sync the related project issues (only in repos with a gh-proman config)",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(gh *)",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/gh-proman/scripts/hook.py\"",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*(create_issue|issue_write|create_pull_request|merge_pull_request)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/gh-proman/scripts/hook.py\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

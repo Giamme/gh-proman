@@ -1,0 +1,13 @@
+{
+  "name": "gh-proman",
+  "description": "GitHub Projects issue manager for agent teams: well-formed issues on the configured board with a duplicate guard, automatic sync of related issues after every issue/PR creation or merge (context comments, status block, auto-close at high confidence), and an audit mode that reconciles a repo's history with its open issues.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Giamme",
+    "url": "https://github.com/Giamme"
+  },
+  "homepage": "https://github.com/Giamme/gh-proman",
+  "repository": "https://github.com/Giamme/gh-proman",
+  "license": "MIT",
+  "keywords": ["github", "github-projects", "issues", "project-management", "agents", "sync"]
+}

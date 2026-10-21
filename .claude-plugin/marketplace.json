@@ -1,0 +1,16 @@
+{
+  "name": "gh-proman",
+  "owner": {
+    "name": "Giamme"
+  },
+  "metadata": {
+    "description": "GitHub Projects issues kept in sync by every agent on the team."
+  },
+  "plugins": [
+    {
+      "name": "gh-proman",
+      "source": ".",
+      "description": "GitHub Projects issue manager for agent teams: well-formed issues with a duplicate guard, automatic sync of related issues after every issue/PR creation or merge, and a repo-vs-issues audit."
+    }
+  ]
+}

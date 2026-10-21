@@ -1,0 +1,4 @@
+interface:
+  display_name: "gh-proman"
+  short_description: "GitHub Projects issues kept in sync: create, sync after PRs, audit"
+  default_prompt: "Use $gh-proman to open an issue on the board, sync the issues related to this PR, or audit the board against this repo."

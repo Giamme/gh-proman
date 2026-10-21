@@ -1,0 +1,95 @@
+{
+  "skill_name": "gh-proman",
+  "trigger_evals": {
+    "should_trigger": [
+      "Apri una issue sul progetto per il bug del login Google che resta in attesa",
+      "Is there already a ticket on the board for the CSV export?",
+      "gh-proman: you just opened PR acme/app#12 (board acme/1). Sync it now, following the Sync section of the gh-proman skill",
+      "Audit the project board against this repo and tell me which issues are already done",
+      "aggiorna le issue del progetto con quello che abbiamo mergiato questa settimana",
+      "Move S03 to In review and set it to P0",
+      "I merged the PR, close whatever it finished on the board",
+      "Create the tasks for this plan as issues on our GitHub project, one per package"
+    ],
+    "should_not_trigger": [
+      "Create a Linear issue for this bug",
+      "Fix the failing test in src/reports/csv.test.ts",
+      "Write a GitHub Action that runs the tests on every push",
+      "What does git rebase --onto do?",
+      "Move this card to Done in Trello",
+      "Review this PR for correctness bugs"
+    ]
+  },
+  "evals": [
+    {
+      "id": 1,
+      "name": "setup-ask-first",
+      "harness": "ask-and-stop",
+      "prompt": "We track everything on our GitHub project now. Set gh-proman up for this repo so the agents keep the issues in sync.",
+      "files": ["evals/fixtures/make_fixture.py setup"],
+      "expected_output": "Runs doctor/config show, then asks in one message for the board URL, language, integration branches and repo-vs-user config; writes nothing until answered.",
+      "assertions": [
+        "Asks which project board to use",
+        "Asks the language for issues and comments",
+        "Asks which branches count as integration branches",
+        "No .github/gh-proman.json is written and gh.log has no mutating call"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "create-duplicate-guard",
+      "harness": "continue",
+      "prompt": "Apri una issue: dopo il consenso Google il login resta bloccato in caricamento. Priorità P1.",
+      "files": ["evals/fixtures/make_fixture.py create-duplicate"],
+      "expected_output": "Drafts a bug from the Italian template, lints it, create exits 3 pointing at acme/app#4; the agent shows #4 and offers to comment on it instead of creating a duplicate, creating nothing yet.",
+      "assertions": [
+        "The draft follows the Italian bug template (Contesto, Come riprodurre, Attività, Criteri di chiusura, Test e verifica)",
+        "The agent tells the user that acme/app#4 looks like the same problem",
+        "No new issue exists in state.json (still only #4)",
+        "It does not pass --confirm-new without the user's answer"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "sync-pr-opened",
+      "harness": "continue",
+      "prompt": "gh-proman: you just opened PR acme/app#12 (board acme/1). Sync it now, following the Sync section of the gh-proman skill:\n  python3 \"<skill_dir>/scripts/gh_proman.py\" sync --source https://github.com/acme/app/pull/12 --apply --json\nThen write the `needs_text` comments and judge `needs_judgment` candidates. Don't close issues when a PR is opened. Write comments in Italian.",
+      "files": ["evals/fixtures/make_fixture.py sync-pr-opened"],
+      "expected_output": "#7 moves to In review with a status block listing PR #12 and gets one short Italian pr-opened comment; #8 (plan, Refs only) gets at most a short comment and no status change; nothing is closed.",
+      "assertions": [
+        "acme/app#7 Status is In review on the board",
+        "acme/app#7 body starts with the gh-proman status block mentioning acme/app#12, and the original body follows unchanged",
+        "acme/app#7 has exactly one gh-proman comment, in Italian, saying what the PR does and what remains",
+        "acme/app#8 Status is unchanged",
+        "No issue is closed"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "sync-merge-stacked",
+      "harness": "continue",
+      "prompt": "I just merged acme/app#12 into feat/reports-base. Sync the board.",
+      "files": ["evals/fixtures/make_fixture.py sync-merge-stacked"],
+      "expected_output": "Recognises the merge did not reach dev/main, comments pr-merged-partial on #7, does not close it.",
+      "assertions": [
+        "acme/app#7 stays OPEN",
+        "acme/app#7 gets a comment that says the work merged into a stacked branch and is not yet in dev",
+        "No raw `gh issue close` in gh.log"
+      ]
+    },
+    {
+      "id": 5,
+      "name": "audit-respects-criteria",
+      "harness": "continue",
+      "prompt": "Audit the board against this repo. Close what's done.",
+      "files": ["evals/fixtures/make_fixture.py audit-close"],
+      "expected_output": "audit-scan finds the commit closing #7 on dev; the agent checks the two open criteria against the commit, closes #7 only with a criteria map (or comments if a criterion isn't evidenced), and records --covered on handled issues.",
+      "assertions": [
+        "Runs audit-scan",
+        "Either closes acme/app#7 with a closing comment that maps both criteria to evidence, or leaves it open with a comment naming the criterion without evidence",
+        "acme/app#8 is not closed",
+        "The handled issue's status block records the audited head (covered)"
+      ]
+    }
+  ]
+}

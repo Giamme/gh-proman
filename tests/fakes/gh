@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""Stateful fake `gh` for the gh-proman tests.
+
+State lives in the JSON file named by GH_FAKE_STATE; every call is appended to GH_FAKE_LOG as JSONL
+({"argv": [...], "input": <parsed stdin or null>}). It implements only what gh_proman.py uses: `gh api`
+(REST paths and GraphQL operations, dispatched by operation name), `gh auth status`, `gh --version` and
+`gh pr view <selector> --json url,number`.
+"""
+
+import json
+import os
+import re
+import sys
+
+STATE = os.environ["GH_FAKE_STATE"]
+LOG = os.environ.get("GH_FAKE_LOG")
+
+
+def load():
+    with open(STATE, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def save(state):
+    with open(STATE, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=1)
+
+
+def out(data):
+    sys.stdout.write(json.dumps(data))
+    sys.exit(0)
+
+
+def fail(message, code=1):
+    sys.stderr.write(message + "\n")
+    sys.exit(code)
+
+
+def next_id(state, prefix):
+    state["seq"] = state.get("seq", 1000) + 1
+    return f"{prefix}{state['seq']}"
+
+
+def tick(state):
+    # Monotonic fake clock so updated_at changes on every write.
+    state["clock"] = state.get("clock", 0) + 1
+    return f"2026-10-21T10:{state['clock'] // 60:02d}:{state['clock'] % 60:02d}Z"
+
+
+def repo(state, slug):
+    if slug not in state["repos"]:
+        fail(f"HTTP 404: Not Found (repos/{slug})")
+    return state["repos"][slug]
+
+
+def issue_url(slug, n):
+    return f"https://github.com/{slug}/issues/{n}"
+
+
+def pr_url(slug, n):
+    return f"https://github.com/{slug}/pull/{n}"
+
+
+def find_node(state, node_id):
+    for slug, r in state["repos"].items():
+        for n, issue in r.get("issues", {}).items():
+            if issue["node_id"] == node_id:
+                return "issue", slug, issue
+        for n, pr in r.get("pulls", {}).items():
+            if pr["node_id"] == node_id:
+                return "pr", slug, pr
+    return None, None, None
+
+
+def content_key(kind, slug, number):
+    return f"{slug}#{number}"
+
+
+def project_items_for(state, kind, slug, number):
+    nodes = []
+    key = content_key(kind, slug, number)
+    for project in state.get("projects", {}).values():
+        for item in project["items"]:
+            if item["content"] == key:
+                status = item.get("fields", {}).get("Status")
+                nodes.append({"id": item["id"], "project": {"id": project["id"]},
+                              "status": {"name": status} if status else None})
+    return {"nodes": nodes}
+
+
+def pr_refs(state, slug, issue_number):
+    nodes = []
+    for s, r in state["repos"].items():
+        for n, pr in r.get("pulls", {}).items():
+            if f"{slug}#{issue_number}" in pr.get("closing", []):
+                nodes.append(pr_summary(s, pr))
+    return {"nodes": nodes}
+
+
+def pr_summary(slug, pr):
+    return {"url": pr_url(slug, pr["number"]), "number": pr["number"], "state": pr["state"],
+            "isDraft": pr.get("draft", False), "baseRefName": pr["base"], "repository": {"nameWithOwner": slug}}
+
+
+def gql_issue(state, slug, issue, with_items=True):
+    node = {"__typename": "Issue", "id": issue["node_id"], "number": issue["number"], "title": issue["title"],
+            "body": issue.get("body", ""), "url": issue_url(slug, issue["number"]), "state": issue["state"],
+            "stateReason": issue.get("state_reason"), "createdAt": issue["created_at"],
+            "updatedAt": issue["updated_at"], "author": {"login": issue["author"]},
+            "repository": {"nameWithOwner": slug},
+            "closedByPullRequestsReferences": pr_refs(state, slug, issue["number"])}
+    if with_items:
+        node["projectItems"] = project_items_for(state, "issue", slug, issue["number"])
+    return node
+
+
+def gql_pull(state, slug, pr):
+    return {"__typename": "PullRequest", "id": pr["node_id"], "number": pr["number"], "title": pr["title"],
+            "body": pr.get("body", ""), "url": pr_url(slug, pr["number"]), "state": pr["state"],
+            "isDraft": pr.get("draft", False), "merged": pr["state"] == "MERGED", "mergedAt": pr.get("merged_at"),
+            "createdAt": pr.get("created_at", "2026-10-20T09:00:00Z"), "headRefName": pr["head"],
+            "baseRefName": pr["base"], "author": {"login": pr.get("author", "me")},
+            "mergeCommit": {"oid": pr["merge_sha"]} if pr.get("merge_sha") else None,
+            "closingIssuesReferences": {"nodes": [{"url": issue_url(*c.split("#")), "number": int(c.split("#")[1]),
+                                                   "repository": {"nameWithOwner": c.split("#")[0]}}
+                                                  for c in pr.get("closing", [])]},
+            "files": {"nodes": [{"path": p} for p in pr.get("files", [])]},
+            "commits": {"nodes": [{"commit": {"oid": c["oid"], "messageHeadline": c["headline"],
+                                              "messageBody": c.get("body", "")}} for c in pr.get("commits", [])]},
+            "projectItems": project_items_for(state, "pr", slug, pr["number"]),
+            "repository": {"nameWithOwner": slug}}
+
+
+def project_by_owner(state, owner, number):
+    return state.get("projects", {}).get(f"{owner}/{number}")
+
+
+def project_by_id(state, pid):
+    for p in state.get("projects", {}).values():
+        if p["id"] == pid:
+            return p
+    fail(f"GraphQL: Could not resolve to a node with the global id of '{pid}'")
+
+
+def graphql(state, payload):
+    query, v = payload["query"], payload.get("variables") or {}
+    op = re.match(r"\s*(query|mutation)\s+(\w+)", query).group(2)
+    if op == "GhpProject":
+        p = project_by_owner(state, v["owner"], v["number"])
+        node = None
+        if p:
+            node = {"id": p["id"], "title": p["title"], "url": f"https://github.com/orgs/{v['owner']}/projects/{v['number']}",
+                    "fields": {"nodes": p["fields"]}}
+        out({"data": {"repositoryOwner": {"login": v["owner"], "projectV2": node}}})
+    if op == "GhpProjectItems":
+        p = project_by_owner(state, v["owner"], v["number"])
+        nodes = []
+        for item in p["items"]:
+            slug, n = item["content"].split("#")
+            r = state["repos"][slug]
+            if n in r.get("issues", {}):
+                content = gql_issue(state, slug, r["issues"][n], with_items=False)
+            else:
+                pr = r["pulls"][n]
+                content = {"__typename": "PullRequest", "id": pr["node_id"], "number": pr["number"],
+                           "title": pr["title"], "url": pr_url(slug, pr["number"]), "state": pr["state"],
+                           "isDraft": pr.get("draft", False), "repository": {"nameWithOwner": slug}}
+            fields = item.get("fields", {})
+            nodes.append({"id": item["id"],
+                          "status": {"name": fields[v["status"]]} if fields.get(v["status"]) else None,
+                          "priority": {"name": fields[v["priority"]]} if fields.get(v["priority"]) else None,
+                          "content": content})
+        start = int(v.get("after") or 0)
+        page = nodes[start:start + 50]
+        has_next = start + 50 < len(nodes)
+        out({"data": {"repositoryOwner": {"projectV2": {"items": {
+            "pageInfo": {"hasNextPage": has_next, "endCursor": str(start + 50) if has_next else None},
+            "nodes": page}}}}})
+    if op == "GhpIssue":
+        slug = f"{v['owner']}/{v['repo']}"
+        issue = repo(state, slug).get("issues", {}).get(str(v["number"]))
+        out({"data": {"repository": {"issue": gql_issue(state, slug, issue) if issue else None}}})
+    if op == "GhpPull":
+        slug = f"{v['owner']}/{v['repo']}"
+        r = repo(state, slug)
+        pr = r.get("pulls", {}).get(str(v["number"]))
+        out({"data": {"repository": {"nameWithOwner": slug, "defaultBranchRef": {"name": r["default_branch"]},
+                                     "pullRequest": gql_pull(state, slug, pr) if pr else None}}})
+    if op == "GhpKind":
+        slug = f"{v['owner']}/{v['repo']}"
+        r = repo(state, slug)
+        n = str(v["number"])
+        kind = "Issue" if n in r.get("issues", {}) else ("PullRequest" if n in r.get("pulls", {}) else None)
+        out({"data": {"repository": {"issueOrPullRequest": {"__typename": kind} if kind else None}}})
+    if op == "GhpMergedPulls":
+        slug = f"{v['owner']}/{v['repo']}"
+        prs = [p for p in repo(state, slug).get("pulls", {}).values() if p["state"] == "MERGED"]
+        prs.sort(key=lambda p: p.get("merged_at") or "", reverse=True)
+        nodes = []
+        for pr in prs:
+            g = gql_pull(state, slug, pr)
+            nodes.append({k: g[k] for k in ("number", "title", "body", "url", "mergedAt", "headRefName", "baseRefName",
+                                            "mergeCommit", "closingIssuesReferences", "files", "commits")})
+        out({"data": {"repository": {"pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                      "nodes": nodes}}}})
+    if op == "GhpAddItem":
+        p = project_by_id(state, v["project"])
+        kind, slug, node = find_node(state, v["content"])
+        key = content_key(kind, slug, node["number"])
+        for item in p["items"]:
+            if item["content"] == key:
+                out({"data": {"addProjectV2ItemById": {"item": {"id": item["id"]}}}})
+        item = {"id": next_id(state, "PVTI_"), "content": key, "fields": {}}
+        p["items"].append(item)
+        save(state)
+        out({"data": {"addProjectV2ItemById": {"item": {"id": item["id"]}}}})
+    if op == "GhpSetField":
+        p = project_by_id(state, v["project"])
+        field = next(f for f in p["fields"] if f["id"] == v["field"])
+        option = next(o for o in field["options"] if o["id"] == v["option"])
+        item = next(i for i in p["items"] if i["id"] == v["item"])
+        item.setdefault("fields", {})[field["name"]] = option["name"]
+        save(state)
+        out({"data": {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": item["id"]}}}})
+    if op == "GhpCreateField":
+        p = project_by_id(state, v["project"])
+        fid = next_id(state, "PVTSSF_")
+        p["fields"].append({"id": fid, "name": v["name"], "dataType": "SINGLE_SELECT",
+                            "options": [{"id": next_id(state, "opt_"), **o} for o in v["options"]]})
+        save(state)
+        out({"data": {"createProjectV2Field": {"projectV2Field": {"id": fid}}}})
+    if op == "GhpUpdateField":
+        for p in state["projects"].values():
+            for f in p["fields"]:
+                if f["id"] == v["field"]:
+                    f["options"] = [{"id": o.get("id") or next_id(state, "opt_"), **{k: o[k] for k in o if k != "id"}}
+                                    for o in v["options"]]
+                    save(state)
+                    out({"data": {"updateProjectV2Field": {"projectV2Field": {"id": f["id"], "options": f["options"]}}}})
+        fail("field not found")
+    if op == "GhpCloseIssue":
+        kind, slug, issue = find_node(state, v["issue"])
+        issue["state"] = "CLOSED"
+        issue["state_reason"] = v.get("reason")
+        if v.get("duplicate"):
+            issue["duplicate_of"] = v["duplicate"]
+        issue["updated_at"] = tick(state)
+        save(state)
+        out({"data": {"closeIssue": {"issue": {"id": issue["node_id"], "state": "CLOSED"}}}})
+    if op == "GhpAddSubIssue":
+        _, _, parent = find_node(state, v["parent"])
+        parent.setdefault("sub_issues", []).append(v["child"])
+        save(state)
+        out({"data": {"addSubIssue": {"issue": {"id": parent["node_id"]}}}})
+    fail(f"fake gh: unknown GraphQL operation {op}")
+
+
+def rest_issue(slug, issue):
+    return {"number": issue["number"], "node_id": issue["node_id"], "title": issue["title"],
+            "body": issue.get("body", ""), "state": issue["state"].lower(), "updated_at": issue["updated_at"],
+            "created_at": issue["created_at"], "html_url": issue_url(slug, issue["number"]),
+            "user": {"login": issue["author"]}}
+
+
+def rest(state, method, path, payload):
+    path = path.split("?", 1)[0].strip("/")
+    if path == "user":
+        out({"login": state["viewer"]})
+    m = re.fullmatch(r"repos/([^/]+/[^/]+)", path)
+    if m:
+        r = repo(state, m.group(1))
+        out({"full_name": m.group(1), "default_branch": r["default_branch"]})
+    m = re.fullmatch(r"repos/([^/]+/[^/]+)/branches/(.+)", path)
+    if m:
+        if m.group(2) in repo(state, m.group(1)).get("branches", []):
+            out({"name": m.group(2)})
+        fail("HTTP 404: Branch not found")
+    m = re.fullmatch(r"repos/([^/]+/[^/]+)/compare/(.+?)\.\.\.(.+)", path)
+    if m:
+        status = repo(state, m.group(1)).get("compare", {}).get(f"{m.group(2)}...{m.group(3)}", "diverged")
+        out({"status": status})
+    m = re.fullmatch(r"repos/([^/]+/[^/]+)/commits/(\w+)", path)
+    if m:
+        c = repo(state, m.group(1)).get("commits", {}).get(m.group(2))
+        if not c:
+            fail("HTTP 422: No commit found")
+        out({"sha": m.group(2), "commit": {"message": c}})
+    m = re.fullmatch(r"repos/([^/]+/[^/]+)/issues", path)
+    if m and method == "POST":
+        slug = m.group(1)
+        r = repo(state, slug)
+        numbers = [int(n) for n in list(r.get("issues", {})) + list(r.get("pulls", {}))]
+        n = max(numbers or [0]) + 1
+        stamp = tick(state)
+        issue = {"number": n, "node_id": next_id(state, "I_"), "title": payload["title"], "body": payload.get("body", ""),
+                 "state": "OPEN", "author": state["viewer"], "created_at": stamp, "updated_at": stamp, "comments": []}
+        r.setdefault("issues", {})[str(n)] = issue
+        save(state)
+        out(rest_issue(slug, issue))
+    m = re.fullmatch(r"repos/([^/]+/[^/]+)/issues/(\d+)", path)
+    if m:
+        slug = m.group(1)
+        issue = repo(state, slug)["issues"].get(m.group(2))
+        if not issue:
+            fail("HTTP 404: Not Found")
+        if method == "PATCH":
+            for key in ("title", "body"):
+                if key in payload:
+                    issue[key] = payload[key]
+            issue["updated_at"] = tick(state)
+            save(state)
+            out(rest_issue(slug, issue))
+        race = state.get("race")
+        if race and race["issue"] == f"{slug}#{issue['number']}":
+            race["gets"] = race.get("gets", 0) + 1
+            if race["gets"] == race.get("on_get", 2):
+                issue["body"] = issue.get("body", "") + race["append"]
+                issue["updated_at"] = tick(state)
+                save(state)
+            else:
+                save(state)
+        out(rest_issue(slug, issue))
+    m = re.fullmatch(r"repos/([^/]+/[^/]+)/issues/(\d+)/comments", path)
+    if m:
+        slug = m.group(1)
+        issue = repo(state, slug)["issues"][m.group(2)]
+        if method == "POST":
+            cid = int(next_id(state, ""))
+            comment = {"id": cid, "user": {"login": state["viewer"]}, "body": payload["body"],
+                       "created_at": state.get("now", "2026-10-21T10:00:00Z"),
+                       "html_url": f"{issue_url(slug, issue['number'])}#issuecomment-{cid}"}
+            issue.setdefault("comments", []).append(comment)
+            save(state)
+            out(comment)
+        out([issue.get("comments", [])])  # one page; callers pass --paginate --slurp
+    m = re.fullmatch(r"repos/([^/]+/[^/]+)/issues/comments/(\d+)", path)
+    if m and method == "PATCH":
+        for issue in repo(state, m.group(1))["issues"].values():
+            for c in issue.get("comments", []):
+                if c["id"] == int(m.group(2)):
+                    c["body"] = payload["body"]
+                    save(state)
+                    out(c)
+        fail("HTTP 404: comment not found")
+    fail(f"fake gh: unsupported REST {method} {path}")
+
+
+def main(argv):
+    raw = sys.stdin.read() if "--input" in argv else ""
+    payload = json.loads(raw) if raw.strip() else None
+    if LOG:
+        with open(LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"argv": argv, "input": payload}) + "\n")
+    state = load()
+    if argv[:1] == ["--version"]:
+        print("gh version 2.101.0 (2026-09-15)")
+        return
+    if argv[:2] == ["auth", "status"]:
+        scopes = state.get("scopes", "'project', 'repo'")
+        sys.stderr.write("github.com\n  ✓ Logged in to github.com account me (keyring)\n  - Active account: true\n"
+                         f"  - Token scopes: {scopes}\n")
+        return
+    if argv[:2] == ["pr", "view"]:
+        sel = argv[2]
+        slug = argv[argv.index("-R") + 1]
+        for pr in repo(state, slug).get("pulls", {}).values():
+            if pr["head"] == sel or str(pr["number"]) == sel:
+                out({"url": pr_url(slug, pr["number"]), "number": pr["number"]})
+        fail(f"no pull requests found for branch \"{sel}\"")
+    if argv[:1] == ["api"]:
+        args = argv[1:]
+        method = "GET"
+        if "-X" in args:
+            method = args[args.index("-X") + 1]
+        path = next(a for a in args if not a.startswith("-") and a not in (method, "-"))
+        if path == "graphql":
+            graphql(state, payload)
+        if "--jq" in args and path == "user":
+            print(state["viewer"])
+            return
+        rest(state, method, path, payload)
+    fail(f"fake gh: unsupported command {argv}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
