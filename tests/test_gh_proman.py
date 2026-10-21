@@ -631,6 +631,11 @@ class CloseTests(Case):
         self.assertIn("older", out["refused"])
         self.assertIn("someone else", out["refused"])
 
+    def test_not_planned_needs_no_criteria_map(self):
+        res = self.cj("close", "--issue", "o/r#10", "--reason", "not_planned", "--comment", "Superata da o/r#30.")
+        self.assertEqual(res["action"], "closed")
+        self.assertEqual(self.issue(10)["state_reason"], "NOT_PLANNED")
+
     def test_disabled_autoclose(self):
         self.write_config(autoclose={"enabled": False})
         out = self.close("--criteria-map", str(self.cmap), expect=3)

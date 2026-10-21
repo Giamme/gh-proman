@@ -1432,10 +1432,11 @@ def close_issue(ctx, ref, reason, comment, evidence=(), criteria_map=None, dupli
     mapped = []
     for idx, item in enumerate(open_items, 1):
         ev = criteria_map.get(item["text"]) or criteria_map.get(str(idx))
-        if not ev or not str(ev).strip():
-            problems.append(f"open checklist item without evidence: {item['text'][:120]!r}")
-        else:
+        if ev and str(ev).strip():
             mapped.append((item, str(ev).strip()))
+        elif reason == "completed":
+            # Only a completed issue must prove its checklist; not planned / duplicate are judgments, not delivery.
+            problems.append(f"open checklist item without evidence: {item['text'][:120]!r}")
     if problems:
         raise Refused(f"not closing {ref.short}: " + "; ".join(problems),
                       {"issue": ref.short, "problems": problems, "open_items": open_items})

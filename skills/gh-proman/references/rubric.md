@@ -35,7 +35,7 @@ In any other case, post a `duplicate-candidate` comment on both issues, linking 
 
 ## Not planned (`--reason not_planned`)
 
-Only when the user says so, or when a newer issue/PR explicitly states that it replaces this one. Quote that statement in the comment.
+Only when the user says so, or when a newer issue/PR explicitly states that it replaces this one. Quote that statement in the comment. Open checkboxes don't need evidence for `not_planned` or `duplicate`: those are decisions, not deliveries.
 
 ## Order, limits and undo
 
