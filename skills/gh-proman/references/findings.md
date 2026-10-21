@@ -26,7 +26,7 @@ A task's findings are used only when it passed (`PASS`, or `MERGED` in `results.
   - the finding quoted verbatim;
   - a short checklist (reproduce, fix, regression test; for PLAUSIBLE: confirm or refute);
   - a permalink at the merged commit, or the plain `file:line` when that commit isn't on GitHub yet.
-- **Fingerprint:** each finding gets a hidden `<!-- gh-proman:finding fp=<12 hex> source=forge:<plan>/<task> -->`. The hash covers repo, file and finding text. Re-running `findings` on the same run, or on a later run that repeats a finding, reports it under `already_filed` and creates nothing.
+- **Fingerprint:** each finding gets a hidden `<!-- gh-proman:finding fp=<12 hex> source=forge:<plan>/<task> -->`. The hash covers repo, file and finding text. Re-running `findings` on the same run, or on a later run that repeats a finding, reports it under `already_filed` and creates nothing. Forge files findings itself with `forge issues` where gh-proman isn't set up, marked `<!-- forge:finding fp=… -->` with the same hash; those count as filed too, on the board or not.
 
 ## Choosing what to file
 

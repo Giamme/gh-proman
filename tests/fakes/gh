@@ -314,6 +314,9 @@ def rest(state, method, path, payload):
             fail("HTTP 422: No commit found")
         out({"sha": m.group(2), "commit": {"message": c}})
     m = re.fullmatch(r"repos/([^/]+/[^/]+)/issues", path)
+    if m and method == "GET":
+        slug = m.group(1)
+        out([[rest_issue(slug, i) for i in repo(state, slug).get("issues", {}).values()]])  # one page, --slurp shape
     if m and method == "POST":
         slug = m.group(1)
         r = repo(state, slug)

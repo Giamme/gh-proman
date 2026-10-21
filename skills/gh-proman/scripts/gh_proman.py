@@ -1873,7 +1873,8 @@ def cmd_close(ctx, args):
 # ---------------------------------------------------------------------------------------------- review findings
 
 FINDING_RE = re.compile(r"^\s*[-*]\s*\[(P[0-3])\]\s*\[(CONFIRMED|PLAUSIBLE)\]\s*(\S.*?)\s+[—–]+\s+(.+?)\s*$", re.M)
-FP_MARK_RE = re.compile(r"<!-- gh-proman:finding fp=([0-9a-f]{12})")
+# forge files issues itself when gh-proman isn't set up (`forge issues`), with the same fingerprint.
+FP_MARK_RE = re.compile(r"<!-- (?:gh-proman|forge):finding fp=([0-9a-f]{12})")
 DONE_STATUSES = {"PASS", "MERGED"}
 
 FINDINGS_TEXT = {
@@ -2129,6 +2130,12 @@ def cmd_findings(ctx, args):
     for item in ctx.project().items():
         for fp in FP_MARK_RE.findall(item.get("body") or ""):
             filed[fp] = {"ref": parse_ref(item["url"]).short, "state": item["state"]}
+    # Issues filed before the repo joined the board (e.g. by `forge issues`) aren't board items.
+    for issue in ctx.gh.rest(f"repos/{slug}/issues?state=all&per_page=100", paginate=True) or []:
+        if "pull_request" in issue:
+            continue
+        for fp in FP_MARK_RE.findall(issue.get("body") or ""):
+            filed.setdefault(fp, {"ref": f"{slug}#{issue['number']}", "state": str(issue.get("state", "")).upper()})
     seen, unique = set(), []
     for f in found:
         f["fp"] = finding_fp(slug, f)

@@ -927,6 +927,23 @@ class FindingsTests(Case):
         self.assertEqual(out["created"][0]["skipped"], "possible duplicate")
         self.assertEqual(out["created"][0]["candidates"][0]["ref"], "o/r#50")
 
+    def test_fingerprint_matches_forge_issues(self):
+        # forge's `forge issues` (tests/test_issues.py there) computes the same value: keep them in step.
+        res = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import gh_proman; "
+                              "print(gh_proman.finding_fp('Owner/Repo', {'file': 'src/a.ts', "
+                              "'text': 'Null  deref when the  list is empty.'}))", str(SCRIPTS)],
+                             capture_output=True, text=True, check=True)
+        self.assertEqual(res.stdout.strip(), "d19f17f6ce07")
+
+    def test_issues_filed_by_forge_off_board_count_as_filed(self):
+        drafts = self.cj("findings", "--from", str(self.plan), "--min-severity", "P2")["drafts"]
+        fp = drafts[0]["fingerprints"][0]
+        self.add_issue(60, "[P2] company-import.ts: Company creation…",
+                       f"x\n<!-- forge:finding fp={fp} source=forge:plan/import -->", board=False, state="CLOSED")
+        out = self.cj("findings", "--from", str(self.plan), "--min-severity", "P2", "--apply")
+        self.assertEqual(out["already_filed"][0]["ref"], "o/r#60")
+        self.assertEqual(out["created"], [])
+
     def test_standalone_review_dir(self):
         review = self.plan / "final-review"
         review.mkdir()
