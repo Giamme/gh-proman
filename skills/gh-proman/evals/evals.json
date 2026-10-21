@@ -9,7 +9,9 @@
       "aggiorna le issue del progetto con quello che abbiamo mergiato questa settimana",
       "Move S03 to In review and set it to P0",
       "I merged the PR, close whatever it finished on the board",
-      "Create the tasks for this plan as issues on our GitHub project, one per package"
+      "Create the tasks for this plan as issues on our GitHub project, one per package",
+      "The forge run tolerated three P2 findings, open issues for them on the board",
+      "Archivia come issue le segnalazioni PLAUSIBLE della review finale"
     ],
     "should_not_trigger": [
       "Create a Linear issue for this bug",
@@ -26,7 +28,9 @@
       "name": "setup-ask-first",
       "harness": "ask-and-stop",
       "prompt": "We track everything on our GitHub project now. Set gh-proman up for this repo so the agents keep the issues in sync.",
-      "files": ["evals/fixtures/make_fixture.py setup"],
+      "files": [
+        "evals/fixtures/make_fixture.py setup"
+      ],
       "expected_output": "Runs doctor/config show, then asks in one message for the board URL, language, integration branches and repo-vs-user config; writes nothing until answered.",
       "assertions": [
         "Asks which project board to use",
@@ -40,7 +44,9 @@
       "name": "create-duplicate-guard",
       "harness": "continue",
       "prompt": "Apri una issue: dopo il consenso Google il login resta bloccato in caricamento. Priorità P1.",
-      "files": ["evals/fixtures/make_fixture.py create-duplicate"],
+      "files": [
+        "evals/fixtures/make_fixture.py create-duplicate"
+      ],
       "expected_output": "Drafts a bug from the Italian template, lints it, create exits 3 pointing at acme/app#4; the agent shows #4 and offers to comment on it instead of creating a duplicate, creating nothing yet.",
       "assertions": [
         "The draft follows the Italian bug template (Contesto, Come riprodurre, Attività, Criteri di chiusura, Test e verifica)",
@@ -54,7 +60,9 @@
       "name": "sync-pr-opened",
       "harness": "continue",
       "prompt": "gh-proman: you just opened PR acme/app#12 (board acme/1). Sync it now, following the Sync section of the gh-proman skill:\n  python3 \"<skill_dir>/scripts/gh_proman.py\" sync --source https://github.com/acme/app/pull/12 --apply --json\nThen write the `needs_text` comments and judge `needs_judgment` candidates. Don't close issues when a PR is opened. Write comments in Italian.",
-      "files": ["evals/fixtures/make_fixture.py sync-pr-opened"],
+      "files": [
+        "evals/fixtures/make_fixture.py sync-pr-opened"
+      ],
       "expected_output": "#7 moves to In review with a status block listing PR #12 and gets one short Italian pr-opened comment; #8 (plan, Refs only) gets at most a short comment and no status change; nothing is closed.",
       "assertions": [
         "acme/app#7 Status is In review on the board",
@@ -69,7 +77,9 @@
       "name": "sync-merge-stacked",
       "harness": "continue",
       "prompt": "I just merged acme/app#12 into feat/reports-base. Sync the board.",
-      "files": ["evals/fixtures/make_fixture.py sync-merge-stacked"],
+      "files": [
+        "evals/fixtures/make_fixture.py sync-merge-stacked"
+      ],
       "expected_output": "Recognises the merge did not reach dev/main, comments pr-merged-partial on #7, does not close it.",
       "assertions": [
         "acme/app#7 stays OPEN",
@@ -82,7 +92,9 @@
       "name": "audit-respects-criteria",
       "harness": "continue",
       "prompt": "Audit the board against this repo. Close what's done.",
-      "files": ["evals/fixtures/make_fixture.py audit-close"],
+      "files": [
+        "evals/fixtures/make_fixture.py audit-close"
+      ],
       "expected_output": "audit-scan finds the commit closing #7 on dev; the agent checks the two open criteria against the commit, closes #7 only with a criteria map (or comments if a criterion isn't evidenced), and records --covered on handled issues.",
       "assertions": [
         "Runs audit-scan",

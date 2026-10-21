@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import fnmatch
+import hashlib
 import json
 import math
 import os
@@ -1760,26 +1761,24 @@ def format_title(cfg, title, priority, task_id):
     return title
 
 
-def cmd_create(ctx, args):
+def create_issue(ctx, slug, kind, title, body, priority=None, task_id=None, status="backlog", parent=None,
+                 confirm_new=False, dup_title=None):
+    """Create an issue on the board. Raises Refused (with the candidates) when it looks like a duplicate."""
     cfg = ctx.cfg()
-    slug = args.repo or ctx.slug
-    if not slug:
-        raise Fail("pass --repo owner/repo")
-    body = read_text_arg(args, "body", "body_file") or ""
-    priority = args.priority or cfg["priority"]["default"]
+    priority = priority or cfg["priority"]["default"]
     if priority not in cfg["priority"]["options"]:
         raise Fail(f"priority must be one of {', '.join(cfg['priority']['options'])}")
-    lint = lint_body(body, args.type, ctx.lang)
+    lint = lint_body(body, kind, ctx.lang)
     if not lint["ok"]:
         raise Refused("the body failed lint: " + "; ".join(lint["errors"]), {"lint": lint})
-    title = format_title(cfg, args.title, priority, args.id)
+    full_title = format_title(cfg, title, priority, task_id)
     project = ctx.project()
     # Fail before creating anything.
     where, pfield = priority_target(ctx, slug.split("/")[0])
     priority_option(ctx, pfield, priority, where)
-    project.option_id(cfg["status_field"], cfg["status"][args.status])
+    project.option_id(cfg["status_field"], cfg["status"][status])
     warnings = []
-    type_name = (cfg.get("issue_types") or {}).get(args.type)
+    type_name = (cfg.get("issue_types") or {}).get(kind)
     if type_name:
         meta = ctx.org_meta(slug.split("/")[0])
         if meta["types"] is None:
@@ -1791,34 +1790,41 @@ def cmd_create(ctx, args):
             type_name = None
         else:
             type_name = meta["types"][type_name.lower()]["name"]
-    if not args.confirm_new:
-        dups = candidates(ctx, source_from_text(args.title, body), limit=5, mode="duplicate", min_score=0.3)
+    if not confirm_new:
+        dups = candidates(ctx, source_from_text(dup_title or title, body), limit=5, mode="duplicate", min_score=0.3)
         threshold = float(cfg.get("duplicate_threshold", 0.5))
         if dups and dups[0]["score"] >= threshold:
-            emit(ctx, {"refused": "possible duplicate", "threshold": threshold, "candidates": dups,
-                       "next": "show these to the user; comment on/extend an existing issue, or re-run with "
-                               "--confirm-new if it really is new"})
-            return 3
+            raise Refused("possible duplicate", {"threshold": threshold, "candidates": dups,
+                                                 "next": "show these to the user; comment on/extend an existing "
+                                                         "issue, or re-run with --confirm-new if it really is new"})
     ctx.count()
-    payload = {"title": title, "body": body}
+    payload = {"title": full_title, "body": body}
     if type_name:
         payload["type"] = type_name
     data = ctx.gh.rest(f"repos/{slug}/issues", "POST", payload)
     if ctx.gh.dry_run:
-        emit(ctx, {"would_create": {"repo": slug, "title": title, "type": type_name}, "lint": lint,
-                   "warnings": warnings})
-        return 0
+        return {"would_create": {"repo": slug, "title": full_title, "type": type_name, "priority": priority},
+                "lint": lint, "warnings": warnings}
     ref = Ref(*slug.split("/", 1), data["number"], "issue")
-    res = {"url": data["html_url"], "ref": ref.short, "title": title, "type": type_name,
+    res = {"url": data["html_url"], "ref": ref.short, "title": full_title, "type": type_name,
            "lint_warnings": lint["warnings"], "warnings": warnings}
-    res["board"] = ensure_on_board(ctx, ref, node_id=data["node_id"], project_items=[], status=args.status,
+    res["board"] = ensure_on_board(ctx, ref, node_id=data["node_id"], project_items=[], status=status,
                                    priority=priority)
-    if args.parent:
-        parent = load_issue(ctx, parse_ref(args.parent, slug, "issue"))
+    if parent:
+        parent_issue = load_issue(ctx, parse_ref(parent, slug, "issue"))
         ctx.count()
-        ctx.gh.graphql(M_SUB_ISSUE, parent=parent["id"], child=data["node_id"])
-        res["parent"] = parent["url"]
-    emit(ctx, res)
+        ctx.gh.graphql(M_SUB_ISSUE, parent=parent_issue["id"], child=data["node_id"])
+        res["parent"] = parent_issue["url"]
+    return res
+
+
+def cmd_create(ctx, args):
+    slug = args.repo or ctx.slug
+    if not slug:
+        raise Fail("pass --repo owner/repo")
+    body = read_text_arg(args, "body", "body_file") or ""
+    emit(ctx, create_issue(ctx, slug, args.type, args.title, body, args.priority, args.id, args.status, args.parent,
+                           args.confirm_new))
     return 0
 
 
@@ -1861,6 +1867,337 @@ def cmd_close(ctx, args):
     cmap = json.loads(Path(args.criteria_map).read_text(encoding="utf-8")) if args.criteria_map else {}
     emit(ctx, close_issue(ctx, ref, args.reason, comment, args.evidence or [], cmap, args.duplicate_of,
                           args.ack_activity, args.source))
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------- review findings
+
+FINDING_RE = re.compile(r"^\s*[-*]\s*\[(P[0-3])\]\s*\[(CONFIRMED|PLAUSIBLE)\]\s*(\S.*?)\s+[—–]+\s+(.+?)\s*$", re.M)
+FP_MARK_RE = re.compile(r"<!-- gh-proman:finding fp=([0-9a-f]{12})")
+DONE_STATUSES = {"PASS", "MERGED"}
+
+FINDINGS_TEXT = {
+    "it": {
+        "plausible_prefix": "Da verificare: ",
+        "context_tolerated": "Segnalazione della review di forge rimasta aperta: era sotto la soglia bloccante {threshold}, "
+                             "quindi il lavoro è stato integrato senza correggerla.",
+        "context_review": "Segnalazione della review complessiva di forge rimasta aperta: verificare se è già stata "
+                          "corretta prima di lavorarci.",
+        "context_plausible": "Segnalazione PLAUSIBILE della review di forge (confidenza bassa): va verificata prima di "
+                             "correggere. Se risulta infondata, chiudi l'issue spiegando perché.",
+        "origin": "Origine: forge `{plan}`, task `{task}`, review di `{reviewer}`, commit `{commit}`.",
+        "steps": "Come riprodurre",
+        "finding": "Segnalazione",
+        "tasks": ["Riprodurre il caso descritto", "Correggere", "Aggiungere il test di regressione"],
+        "tasks_plausible": ["Verificare se il problema è reale (riprodurlo o smentirlo)",
+                            "Se reale: correggere e aggiungere il test di regressione"],
+        "closing": ["Il caso descritto non si riproduce più"],
+        "closing_plausible": ["Il problema è corretto, oppure smentito con motivazione in un commento"],
+        "tests": ["Test di regressione che fallisce prima della correzione e passa dopo"],
+        "headings": ["Contesto", "Come riprodurre", "Attività", "Criteri di chiusura", "Test e verifica",
+                     "Riferimenti"],
+        "group_title": "Segnalazioni forge non bloccanti: {scope}",
+        "group_context": "Segnalazioni della review di forge rimaste aperte nel run `{plan}` ({n}).",
+        "code": "Codice",
+        "unpublished": "(commit non ancora pubblicato su GitHub)",
+    },
+    "en": {
+        "plausible_prefix": "To verify: ",
+        "context_tolerated": "Forge review finding left open: it was below the blocking threshold {threshold}, so the "
+                             "work was merged without fixing it.",
+        "context_review": "Forge whole-run review finding left open: check whether it was already fixed before "
+                          "working on it.",
+        "context_plausible": "PLAUSIBLE forge review finding (low confidence): verify it before fixing. If it turns out "
+                             "to be wrong, close the issue saying why.",
+        "origin": "Origin: forge `{plan}`, task `{task}`, reviewed by `{reviewer}`, commit `{commit}`.",
+        "steps": "Steps to reproduce",
+        "finding": "Finding",
+        "tasks": ["Reproduce the described case", "Fix it", "Add the regression test"],
+        "tasks_plausible": ["Check whether the problem is real (reproduce or refute it)",
+                            "If real: fix it and add the regression test"],
+        "closing": ["The described case no longer reproduces"],
+        "closing_plausible": ["The problem is fixed, or refuted with the reasoning in a comment"],
+        "tests": ["Regression test that fails before the fix and passes after"],
+        "headings": ["Context", "Steps to reproduce", "Tasks", "Closing criteria", "Tests and verification",
+                     "References"],
+        "group_title": "Non-blocking forge findings: {scope}",
+        "group_context": "Forge review findings left open in run `{plan}` ({n}).",
+        "code": "Code",
+        "unpublished": "(commit not pushed to GitHub yet)",
+    },
+}
+
+
+def _read(path: Path):
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def reviewer_spec(task_dir: Path):
+    kv = dict(line.split("=", 1) for line in _read(task_dir / "qa.resolved").splitlines() if "=" in line)
+    spec = ":".join(x for x in (kv.get("alias"), kv.get("effort"), kv.get("harness")) if x)
+    return spec or "?"
+
+
+def clean_markdown(text):
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    return re.sub(r"(\*\*|__|`)", "", text).strip()
+
+
+def parse_findings(text):
+    out = []
+    for m in FINDING_RE.finditer(text or ""):
+        loc = m.group(3).strip()
+        link = re.fullmatch(r"\[([^\]]+)\]\([^)]*\)", loc)
+        loc = (link.group(1) if link else loc).strip("` ")
+        lm = re.match(r"(.+?):(\d+)(?:[-:]\d+)?$", loc)
+        raw = f"[{m.group(1)}][{m.group(2)}] {loc} — {m.group(4).strip()}"
+        out.append({"severity": m.group(1), "confidence": m.group(2), "file": lm.group(1) if lm else loc,
+                    "line": int(lm.group(2)) if lm else None, "text": clean_markdown(m.group(4)), "raw": raw})
+    return out
+
+
+def task_findings(task_dir: Path, plan_dir, include_plausible, reviewers):
+    """Tolerated (known_issues.md) and, optionally, PLAUSIBLE (qa.last) findings of a task that passed."""
+    status = _read(task_dir / "status").split()[:1]
+    status = status[0] if status else ""
+    results = {}
+    if plan_dir and (plan_dir / "results.tsv").is_file():
+        for line in _read(plan_dir / "results.tsv").splitlines():
+            cols = line.split("\t")
+            if len(cols) >= 2:
+                results[cols[0]] = cols[1]
+    task = task_dir.name
+    state = results.get(task, status)
+    standalone = not status and task not in results and not (task_dir / "known_issues.md").exists()
+    if standalone:
+        # A review with no task behind it (whole-run/final review): what it found is still open.
+        found = []
+        for f in parse_findings(_read(task_dir / "qa.last")):
+            if f["confidence"] == "CONFIRMED" or include_plausible:
+                found.append({**f, "origin": "review" if f["confidence"] == "CONFIRMED" else "plausible",
+                              "task": task, "threshold": "-", "commit": _read(task_dir / "reviewed.commit"),
+                              "reviewer": reviewer_spec(task_dir)})
+        return found, None
+    if state not in DONE_STATUSES and status not in DONE_STATUSES:
+        return [], f"{task}: status {state or 'unknown'}, its findings still block it"
+    threshold = _read(task_dir / "qa_threshold") or (_read(plan_dir / "qa_threshold") if plan_dir else "")
+    commit = _read(task_dir / "merged") or _read(task_dir / "reviewed.commit")
+    reviewer = reviewers.get(task) or reviewer_spec(task_dir)
+    found = []
+    for f in parse_findings(_read(task_dir / "known_issues.md")):
+        if f["confidence"] == "CONFIRMED":
+            found.append({**f, "origin": "tolerated"})
+    if include_plausible:
+        for f in parse_findings(_read(task_dir / "qa.last")):
+            if f["confidence"] == "PLAUSIBLE":
+                found.append({**f, "origin": "plausible"})
+    for f in found:
+        f.update({"task": task, "threshold": threshold or "?", "commit": commit, "reviewer": reviewer})
+    return found, None
+
+
+def collect_findings(path: Path, include_plausible):
+    path = path.resolve()
+    notes, findings = [], []
+    if path.is_file():
+        plan_dir = None
+        tasks = [path.parent]
+        if path.name == "known_issues.md" or path.name == "qa.last":
+            items = parse_findings(_read(path))
+            for f in items:
+                if f["confidence"] == "CONFIRMED" or include_plausible:
+                    f.update({"origin": "tolerated" if f["confidence"] == "CONFIRMED" else "plausible",
+                              "task": path.parent.name, "threshold": _read(path.parent / "qa_threshold") or "?",
+                              "commit": _read(path.parent / "merged") or _read(path.parent / "reviewed.commit"),
+                              "reviewer": reviewer_spec(path.parent)})
+                    findings.append(f)
+            return {"plan": path.parent.name, "plan_dir": None, "repo_path": None}, findings, notes
+        raise Fail(f"{path}: expected a forge plan or task directory, known_issues.md or qa.last")
+    if (path / "tasks").is_dir():
+        plan_dir = path
+        tasks = sorted(d for d in (path / "tasks").iterdir() if d.is_dir() and not d.name.startswith("_"))
+    elif (path / "qa.last").is_file() or (path / "known_issues.md").is_file():
+        if path.parent.name == "tasks":
+            plan_dir = path.parent.parent
+        elif (path.parent / "tasks").is_dir():
+            plan_dir = path.parent  # e.g. <plan>/final-review
+        else:
+            plan_dir = None
+        tasks = [path]
+    else:
+        raise Fail(f"{path} is not a forge run: no tasks/, qa.last or known_issues.md")
+    reviewers = {}
+    if plan_dir and (plan_dir / "tasks.tsv").is_file():
+        for line in _read(plan_dir / "tasks.tsv").splitlines():
+            cols = line.split("\t")
+            if len(cols) >= 6 and not line.startswith("#"):
+                reviewers[cols[0]] = cols[5]
+    for task_dir in tasks:
+        items, note = task_findings(task_dir, plan_dir, include_plausible, reviewers)
+        findings += items
+        if note:
+            notes.append(note)
+    repo_path = _read(plan_dir / "repo") if plan_dir else ""
+    meta = {"plan": (plan_dir or path).name, "plan_dir": str(plan_dir) if plan_dir else None,
+            "repo_path": repo_path or None}
+    return meta, findings, notes
+
+
+def finding_fp(slug, f):
+    norm = re.sub(r"\s+", " ", f["text"].lower())[:160]
+    return hashlib.sha1(f"{slug.lower()}|{f['file']}|{norm}".encode("utf-8")).hexdigest()[:12]
+
+
+def finding_title(f, lang):
+    first = re.split(r"(?<=[.!?])\s", f["text"], maxsplit=1)[0].rstrip(". ")
+    if len(first) > 90:
+        first = first[:87].rsplit(" ", 1)[0] + "…"
+    title = f"{os.path.basename(f['file'])}: {first}"
+    if f["origin"] == "plausible":
+        title = FINDINGS_TEXT[lang]["plausible_prefix"] + title
+    return title
+
+
+def finding_link(ctx, slug, repo, f):
+    if not f.get("commit") or not f.get("line") and not f.get("file"):
+        return None, False
+    published = bool(repo.root) and bool(repo.git("branch", "-r", "--contains", f["commit"], check=False))
+    if not published:
+        cmp = ctx.gh.try_rest(f"repos/{slug}/commits/{f['commit']}")
+        published = bool(cmp and cmp.get("sha"))
+    url = f"https://github.com/{slug}/blob/{f['commit']}/{f['file']}" + (f"#L{f['line']}" if f.get("line") else "")
+    return url, published
+
+
+def finding_body(ctx, slug, repo, plan, items):
+    t = FINDINGS_TEXT[ctx.lang]
+    h = t["headings"]
+    plausible = all(f["origin"] == "plausible" for f in items)
+    first = items[0]
+    if len(items) == 1:
+        context = t["context_plausible"] if plausible else (
+            t["context_review"] if first["origin"] == "review" else
+            t["context_tolerated"].format(threshold=first["threshold"]))
+    else:
+        context = t["group_context"].format(plan=plan, n=len(items))
+    origin = t["origin"].format(plan=plan, task=first["task"], reviewer=first["reviewer"],
+                                commit=(first.get("commit") or "?")[:12])
+    if not first.get("commit"):
+        origin = re.sub(r", commit `\?`", "", origin)
+    lines = [f"## {h[0]}", context, "", origin, "", f"## {h[1]}"]
+    for f in items:
+        lines.append(f"> {escape_ours(f['raw'])}")
+        lines.append("")
+    lines.append(f"## {h[2]}")
+    if len(items) == 1:
+        lines += [f"- [ ] {x}" for x in (t["tasks_plausible"] if plausible else t["tasks"])]
+    else:
+        lines += [f"- [ ] [{f['severity']}] `{f['file']}{':' + str(f['line']) if f['line'] else ''}`: "
+                  f"{escape_ours(f['text'])[:160]}" for f in items]
+    lines += ["", f"## {h[3]}"] + [f"- [ ] {x}" for x in (t["closing_plausible"] if plausible else t["closing"])]
+    lines += ["", f"## {h[4]}"] + [f"- [ ] {x}" for x in t["tests"]]
+    lines += ["", f"## {h[5]}"]
+    for f in items:
+        url, published = finding_link(ctx, slug, repo, f)
+        loc = f"{f['file']}{':' + str(f['line']) if f['line'] else ''}"
+        if url and published:
+            lines.append(f"- {t['code']}: {url}")
+        else:
+            lines.append(f"- {t['code']}: `{loc}` {t['unpublished'] if url else ''}".rstrip())
+    lines.append("")
+    lines += [f"<!-- gh-proman:finding fp={f['fp']} source=forge:{plan}/{f['task']} -->" for f in items]
+    return "\n".join(lines)
+
+
+SEVERITY_ORDER = ["P0", "P1", "P2", "P3"]
+
+
+def cmd_findings(ctx, args):
+    cfg = ctx.cfg()
+    meta, found, notes = collect_findings(Path(args.source), args.include_plausible)
+    repo = Repo(meta["repo_path"]) if meta.get("repo_path") else ctx.repo
+    slug = args.repo or repo.slug or ctx.slug
+    if not slug:
+        raise Fail("cannot tell which repository the findings belong to; pass --repo owner/repo")
+    if args.min_severity:
+        cut = SEVERITY_ORDER.index(args.min_severity)
+        found = [f for f in found if SEVERITY_ORDER.index(f["severity"]) <= cut]
+    filed = {}
+    for item in ctx.project().items():
+        for fp in FP_MARK_RE.findall(item.get("body") or ""):
+            filed[fp] = {"ref": parse_ref(item["url"]).short, "state": item["state"]}
+    seen, unique = set(), []
+    for f in found:
+        f["fp"] = finding_fp(slug, f)
+        if f["fp"] in seen:
+            continue
+        seen.add(f["fp"])
+        f["already_filed"] = filed.get(f["fp"])
+        unique.append(f)
+    todo = [f for f in unique if not f["already_filed"]]
+    groups = []
+    if args.group == "finding":
+        groups = [[f] for f in todo]
+    else:
+        keyed = {}
+        for f in todo:
+            key = (f["origin"], f["task"] if args.group == "task" else meta["plan"])
+            keyed.setdefault(key, []).append(f)
+        groups = list(keyed.values())
+    drafts = []
+    t = FINDINGS_TEXT[ctx.lang]
+    for items in groups:
+        items.sort(key=lambda f: SEVERITY_ORDER.index(f["severity"]))
+        if len(items) == 1:
+            title = finding_title(items[0], ctx.lang)
+        else:
+            scope = items[0]["task"] if args.group == "task" else meta["plan"]
+            title = t["group_title"].format(scope=scope)
+            if items[0]["origin"] == "plausible":
+                title = t["plausible_prefix"] + title
+        draft = {"title": title, "priority": items[0]["severity"], "type": "bug",
+                 "fingerprints": [f["fp"] for f in items], "findings": [f["raw"] for f in items],
+                 "origin": items[0]["origin"], "body": finding_body(ctx, slug, repo, meta["plan"], items)}
+        dups = candidates(ctx, source_from_text(items[0]["text"], items[0]["text"] + " " + items[0]["file"]),
+                          limit=3, mode="duplicate", min_score=0.3)
+        threshold = float(cfg.get("duplicate_threshold", 0.5))
+        draft["possible_duplicates"] = [{"ref": c["ref"], "title": c["title"], "score": c["score"]}
+                                        for c in dups if c["score"] >= threshold]
+        drafts.append(draft)
+    out = {"source": meta, "repo": slug, "notes": notes,
+           "summary": {"findings": len(unique), "already_filed": len(unique) - len(todo), "drafts": len(drafts),
+                       "tolerated": sum(1 for f in todo if f["origin"] == "tolerated"),
+                       "review": sum(1 for f in todo if f["origin"] == "review"),
+                       "plausible": sum(1 for f in todo if f["origin"] == "plausible")},
+           "already_filed": [{"finding": f["raw"], **f["already_filed"]} for f in unique if f["already_filed"]],
+           "drafts": drafts}
+    if args.apply:
+        created = []
+        for draft in drafts[:args.max_issues]:
+            if draft["possible_duplicates"] and not args.confirm_new:
+                created.append({"title": draft["title"], "skipped": "possible duplicate",
+                                "candidates": draft["possible_duplicates"]})
+                continue
+            ctx.actions = 0  # the per-run cap guards sync sprees; findings have their own --max-issues
+            try:
+                res = create_issue(ctx, slug, "bug", draft["title"], draft["body"], draft["priority"],
+                                   confirm_new=True)
+                created.append({"title": draft["title"], **res})
+            except Refused as exc:
+                created.append({"title": draft["title"], "skipped": str(exc)})
+        if len(drafts) > args.max_issues:
+            out["notes"].append(f"only the first {args.max_issues} of {len(drafts)} drafts were created "
+                                "(--max-issues); run again for the rest")
+        out["created"] = created
+        for d in out["drafts"]:
+            d.pop("body", None)
+    elif not args.show_bodies:
+        for d in out["drafts"]:
+            d["body_preview"] = d.pop("body")[:400]
+    emit(ctx, out)
     return 0
 
 
@@ -2258,6 +2595,19 @@ def build_parser():
     p.add_argument("--status", choices=STATUS_ORDER, default="backlog")
     p.add_argument("--parent", help="parent issue (adds this one as a sub-issue)")
     p.add_argument("--confirm-new", action="store_true", help="skip the duplicate guard (after the user chose)")
+
+    p = add("findings", cmd_findings, "draft or create issues for review findings a forge run left open")
+    p.add_argument("--from", dest="source", required=True,
+                   help="forge plan dir, task/run dir, known_issues.md or qa.last")
+    p.add_argument("--include-plausible", action="store_true", help="also PLAUSIBLE findings, as 'to verify' issues")
+    p.add_argument("--group", choices=["finding", "task", "run"], default="finding",
+                   help="one issue per finding (default), per task, or one for the whole run")
+    p.add_argument("--min-severity", choices=SEVERITY_ORDER, help="skip findings milder than this")
+    p.add_argument("--repo", help="owner/repo when it can't be read from the plan")
+    p.add_argument("--apply", action="store_true", help="create the issues (default: only show drafts)")
+    p.add_argument("--confirm-new", action="store_true", help="create even when a similar issue exists")
+    p.add_argument("--max-issues", type=int, default=10)
+    p.add_argument("--show-bodies", action="store_true", help="print full draft bodies")
 
     p = add("comment", cmd_comment, "post or update a gh-proman comment (idempotent by event+source)")
     p.add_argument("--issue", required=True)

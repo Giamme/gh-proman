@@ -842,6 +842,103 @@ class AuditTests(Case):
         self.assertEqual(out["issues"][0]["watermark"]["source"], "status block")
 
 
+# ---------------------------------------------------------------------------------------------- forge findings
+
+class FindingsTests(Case):
+    def setUp(self):
+        super().setUp()
+        self.state["projects"]["o/1"]["fields"][1]["options"] = [{"id": f"p{i}", "name": f"P{i}"} for i in range(4)]
+        self.save()
+        self.sha = self.commit("feat: import", "src/lib/crm/company-import.ts")
+        self.git("update-ref", "refs/remotes/origin/dev", "HEAD")
+        self.plan = self.dir / "plan"
+        (self.plan / "tasks").mkdir(parents=True)
+        (self.plan / "repo").write_text(str(self.root))
+        (self.plan / "qa_threshold").write_text("P1\n")
+        (self.plan / "tasks.tsv").write_text("# id\tdeps\tdifficulty\tfiles\tdwarf\tqa\ttitle\n"
+                                             "import\t-\thigh\tsrc\tsol:high:codex\tsol:xhigh:codex\tImport\n"
+                                             "ui\t-\tlow\tsrc\tsol:high:codex\tsol:xhigh:codex\tUI\n")
+        (self.plan / "results.tsv").write_text("import\tMERGED\tforge/p/import\nui\tFAIL\tforge/p/ui\n")
+        self.task("import", "MERGED", known=[
+            "- [P2][CONFIRMED] src/lib/crm/company-import.ts:645 — Company creation occurs before replaying the "
+            "profile receipt, allowing an unchanged retry to create an extra company.",
+            "- [P3][CONFIRMED] [src/lib/crm/company-import.ts:775](/abs/src/lib/crm/company-import.ts:775) — "
+            "**Persisting `targetListId: null`** makes a list creation race unrecoverable."],
+            qa=["- [P3][PLAUSIBLE] src/lib/crm/lead.ts:12 — Lead names may keep trailing spaces."])
+        self.task("ui", "FAIL", known=[], qa=["- [P1][CONFIRMED] src/ui.tsx:3 — Button does nothing."])
+
+    def task(self, name, status, known, qa):
+        d = self.plan / "tasks" / name
+        d.mkdir()
+        (d / "status").write_text(status + "\n")
+        (d / "merged").write_text(self.sha + "\n")
+        if known:
+            (d / "known_issues.md").write_text("## Known issues (QA findings below blocking threshold P1)\n\n"
+                                               + "\n\n".join(known) + "\n")
+        (d / "qa.last").write_text("VERDICT: PASS\n\n" + "\n".join(known + qa) + "\n")
+
+    def test_drafts_tolerated_findings_of_merged_tasks_only(self):
+        out = self.cj("findings", "--from", str(self.plan))
+        self.assertEqual(out["repo"], "o/r")
+        self.assertEqual(out["summary"]["tolerated"], 2)
+        self.assertEqual(out["summary"]["plausible"], 0)
+        self.assertIn("ui: status FAIL, its findings still block it", out["notes"])
+        first = out["drafts"][0]
+        self.assertEqual(first["priority"], "P2")
+        self.assertEqual(first["title"], "company-import.ts: Company creation occurs before replaying the profile "
+                                         "receipt, allowing an unchanged…")
+        self.assertEqual(out["drafts"][1]["title"],
+                         "company-import.ts: Persisting targetListId: null makes a list creation race unrecoverable")
+        self.assertEqual(self.mutations(), [])
+
+    def test_apply_creates_bug_issues_once(self):
+        out = self.cj("findings", "--from", str(self.plan), "--include-plausible", "--apply")
+        created = [c for c in out["created"] if "ref" in c]
+        self.assertEqual(len(created), 3)
+        issues = self.load()["repos"]["o/r"]["issues"]
+        bodies = {i["title"]: i["body"] for i in issues.values()}
+        body = bodies["company-import.ts: Company creation occurs before replaying the profile receipt, allowing an "
+                      "unchanged…"]
+        self.assertIn("sotto la soglia bloccante P1", body)
+        self.assertIn("review di `sol:xhigh:codex`", body)
+        self.assertIn(f"https://github.com/o/r/blob/{self.sha}/src/lib/crm/company-import.ts#L645", body)
+        self.assertRegex(body, r"<!-- gh-proman:finding fp=[0-9a-f]{12} source=forge:plan/import -->")
+        self.assertIn("Da verificare: lead.ts: Lead names may keep trailing spaces", bodies)
+        prio = {i["title"]: self.item(f"o/r#{i['number']}")["fields"].get("Priority") for i in issues.values()}
+        self.assertEqual(sorted(prio.values()), ["P2", "P3", "P3"])
+        again = self.cj("findings", "--from", str(self.plan), "--include-plausible", "--apply")
+        self.assertEqual(again["summary"]["already_filed"], 3)
+        self.assertEqual(again["created"], [])
+        self.assertEqual(len(self.load()["repos"]["o/r"]["issues"]), 3)
+
+    def test_group_per_run_and_min_severity(self):
+        out = self.cj("findings", "--from", str(self.plan), "--include-plausible", "--group", "run")
+        self.assertEqual([d["title"] for d in out["drafts"]],
+                         ["Segnalazioni forge non bloccanti: plan",
+                          "Da verificare: lead.ts: Lead names may keep trailing spaces"])  # a lone finding keeps its title
+        self.assertEqual(out["drafts"][0]["priority"], "P2")
+        out = self.cj("findings", "--from", str(self.plan), "--min-severity", "P2")
+        self.assertEqual(out["summary"]["findings"], 1)
+
+    def test_duplicates_are_skipped_on_apply(self):
+        self.add_issue(50, "Company creation occurs before replaying the profile receipt",
+                       "An unchanged retry creates an extra company in company-import.ts")
+        out = self.cj("findings", "--from", str(self.plan), "--min-severity", "P2", "--apply")
+        self.assertEqual(out["created"][0]["skipped"], "possible duplicate")
+        self.assertEqual(out["created"][0]["candidates"][0]["ref"], "o/r#50")
+
+    def test_standalone_review_dir(self):
+        review = self.plan / "final-review"
+        review.mkdir()
+        (review / "qa.resolved").write_text("role=qa\nalias=astra\nharness=codex\neffort=xhigh\n")
+        (review / "qa.last").write_text("- [P1][CONFIRMED] src/a.ts:1 — Broken thing.\n"
+                                        "- [P3][PLAUSIBLE] src/b.ts:2 — Maybe broken.\n")
+        out = self.cj("findings", "--from", str(review))
+        self.assertEqual(out["summary"]["review"], 1)
+        self.assertEqual(out["source"]["plan"], "plan")
+        self.assertIn("review di `astra:xhigh:codex`", out["drafts"][0]["body_preview"])
+
+
 # ---------------------------------------------------------------------------------------------- misc
 
 class MiscTests(Case):

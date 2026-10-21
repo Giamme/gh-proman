@@ -10,6 +10,7 @@ When every developer runs their own agent, each agent knows only what it did its
   - a status block in the issue body with the consolidated state;
   - a Status move on the board;
   - an **auto-close** when a merged PR completes them, at high confidence only.
+- **Review findings**: files the findings a forge run left open as bug issues, with priority from the forge severity and a "to verify" title for PLAUSIBLE ones. These are the findings below `--qa-threshold`, the PLAUSIBLE ones and whole-run review leftovers. It never files the same finding twice.
 - **Audit**: reconciles a repository's history with its open board issues. It finds what's already done, what needs an update, and PRs merged in the web UI that no agent synced.
 
 The agent does the judging; a stdlib Python CLI (`skills/gh-proman/scripts/gh_proman.py`) does all GitHub and git I/O. Writes are idempotent (hidden markers), guarded, and available as `--dry-run`.
@@ -97,6 +98,7 @@ Talk to your agent:
 - "Apri una issue per il login Google che resta in attesa, P1": template, lint, duplicate guard, create on the board.
 - `gh pr create …` / `gh pr merge …` as usual: the hook makes the agent sync right after.
 - "Audit the board against this repo" / "aggiorna le issue": audit, a summary, then the changes after you confirm closes.
+- After a forge run: "file the leftover findings as issues", or let forge offer it (`--file-issues ask|auto|off`).
 
 The CLI is usable directly too: `gh-proman doctor`, `gh-proman candidates --pr <url>`, `gh-proman sync --source <url> --dry-run`, `gh-proman audit-scan`. Every command has `--help`.
 

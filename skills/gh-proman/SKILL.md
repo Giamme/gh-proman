@@ -1,6 +1,6 @@
 ---
 name: gh-proman
-description: Use when the team tracks work on a GitHub Project board and the user wants to open, file or track an issue or ticket, plan tasks on the board, check whether an issue already exists, move an issue's status or priority, or update or close issues after a PR. Also use it right after a gh-proman hook message (it appears after `gh issue create`, `gh pr create` or `gh pr merge`, or the GitHub MCP equivalents), and when asked to audit or reconcile the board with a repository ("what's already done?", "aggiorna le issue", "allinea il progetto", "which issues are stale?"). Keeps every agent's issues consistent and in sync: templates per type, a duplicate guard, context comments on related issues, a status block in each issue, and auto-close at high confidence when a merged PR completes an issue. Not for Linear, Jira or Trello, and not for plain git or code questions with no issue-tracking intent.
+description: Use when the team tracks work on a GitHub Project board and the user wants to open, file or track an issue or ticket, plan tasks on the board, check whether an issue already exists, move an issue's status or priority, or update or close issues after a PR. Also use it right after a gh-proman hook message (it appears after `gh issue create`, `gh pr create` or `gh pr merge`, or the GitHub MCP equivalents), when asked to audit or reconcile the board with a repository ("what's already done?", "aggiorna le issue", "allinea il progetto", "which issues are stale?"), and when review findings were left open (forge `known_issues.md`, tolerated or PLAUSIBLE findings, "file the leftover findings as issues"). Keeps every agent's issues consistent and in sync: templates per type, a duplicate guard, context comments on related issues, a status block in each issue, and auto-close at high confidence when a merged PR completes an issue. Not for Linear, Jira or Trello, and not for plain git or code questions with no issue-tracking intent.
 ---
 
 # gh-proman
@@ -107,6 +107,26 @@ Never close anything when a PR is only opened. Draft and stacked PRs (base = ano
 3. Show the user one summary: issues to close (with the evidence), issues to comment on, unsynced PRs. **Ask once before closing anything during an audit**, unless the user already said to close what's done. Comments and status blocks don't need approval.
 4. Apply. Then record the check on every issue you handled with `status-block --issue <i> --covered <owner/repo>=<head sha>`, so the next audit starts from there. Treat each unsynced PR as a `sync --source <pr> --event pr-merged`.
 
+## Review findings (forge runs)
+
+Forge's reviewer labels findings P0–P3 and CONFIRMED/PLAUSIBLE.
+- With `--qa-threshold`, milder CONFIRMED findings are tolerated: the task merges anyway, and the findings land in `tasks/<id>/known_issues.md`.
+- PLAUSIBLE findings never block, so they are dropped.
+- A whole-run review's findings sit in its own `qa.last`.
+
+None of these reach the board unless someone files them.
+
+1. Run `findings --from <plan dir | task dir | review dir | known_issues.md> [--include-plausible] --json`. It drafts one bug issue per finding:
+   - the forge severity becomes the priority;
+   - the body has the finding, a permalink at the merged commit, the run, task and reviewer, and a closing checklist;
+   - PLAUSIBLE ones get a "Da verificare / To verify" title and a "confirm or refute" checklist.
+
+   Findings already filed (a hidden fingerprint in the issue body), tasks that didn't pass (their findings still block) and likely duplicates are reported, not drafted again.
+2. Show the user the drafts once: count, severities, titles, possible duplicates. Ask whether to file all, some (`--min-severity P2`) or one issue per task or run (`--group task|run`), and whether to include the PLAUSIBLE ones.
+3. Run the same command with `--apply`. It creates at most `--max-issues` (10) per run, never re-files a fingerprint, and skips likely duplicates (`--confirm-new` overrides). For a skipped duplicate, comment on the existing issue instead (`comment --event issue-related`).
+
+When forge was started with `--file-issues auto`, file without asking: run with `--apply`, plus `--include-plausible` if the user asked for PLAUSIBLE ones too. Then report what was created and what was skipped. `references/findings.md` has the details.
+
 ## Linking convention (commits and PRs)
 
 - Commits: put `Refs owner/repo#N` in the body. Use `Closes owner/repo#N` only in the commit that completes the issue.
@@ -121,6 +141,7 @@ Never close anything when a PR is only opened. Draft and stacked PRs (base = ano
 |---|---|
 | `config init`, `project setup` (show `--dry-run`) | `doctor`, `config show`, `candidates`, `sync`, `audit-scan`, any `--dry-run` |
 | `create --confirm-new` past the duplicate guard | `create` when the guard passes and the user asked for the issue |
+| `findings --apply` (once, after showing the drafts) | `findings` drafts; `findings --apply` when forge ran with `--file-issues auto` |
 | closing during an audit (once, for the whole list) | sync comments, status blocks, Status moves |
 | closing an issue someone else opened and is actively discussing | closing after a merge when the rubric is met (hook-driven) |
 | `--allow-backward`, editing anyone's issue text | |
@@ -143,3 +164,4 @@ Never close anything when a PR is only opened. Draft and stacked PRs (base = ano
 - `references/comments.md`: comment formats per event, markers, the status block, examples in Italian and English.
 - `references/rubric.md`: auto-close rubric, duplicates, per-run limits, what the script enforces. Read it before any close.
 - `references/linking.md`: Refs/Closes, stacked PRs, integration branches, how links are detected.
+- `references/findings.md`: filing forge review findings: sources, fingerprints, grouping, examples.
