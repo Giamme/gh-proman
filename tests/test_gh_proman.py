@@ -339,7 +339,14 @@ class HookTests(Case):
 
     def test_merge_current_branch_and_auto(self):
         ctx = self.hook(self.bash("gh pr merge --squash", {"stdout": ""}))
-        self.assertIn("<current branch>", ctx)
+        self.assertIn("number is unknown", ctx)  # no commits yet: no branch to name
+        self.commit("init")
+        self.git("checkout", "-q", "-b", "feat/login")
+        ctx = self.hook(self.bash("gh pr merge --squash --delete-branch", {"stdout": ""}, tool_use_id="t-branch"))
+        self.assertIn("sync --source feat/login --repo o/r", ctx)
+        ctx = self.hook(self.bash("gh pr merge --squash", {"stdout": "✓ Squashed and merged pull request o/r#7 (x)"},
+                                  tool_use_id="t-out"))
+        self.assertIn("https://github.com/o/r/pull/7", ctx)
         ctx = self.hook(self.bash("gh pr merge 8 --auto --squash", {"stdout": ""}, tool_use_id="t-auto"))
         self.assertIn("auto-merge was enabled", ctx)
 
@@ -393,6 +400,28 @@ class HookTests(Case):
                                      "tool_input": {"method": "update", "owner": "o", "repo": "r"},
                                      "tool_response": "https://github.com/o/r/issues/3"}))
 
+    def test_review_regressions(self):
+        # The created item's own html_url wins over URLs quoted in its body.
+        issue_json = json.dumps({"html_url": "https://github.com/o/r/issues/10", "number": 10,
+                                 "body": "dup of https://github.com/o/r/issues/3"})
+        ctx = self.hook({"tool_name": "mcp__github__create_issue", "cwd": str(self.root), "tool_use_id": "r1",
+                         "tool_input": {"owner": "o", "repo": "r"},
+                         "tool_response": {"content": [{"type": "text", "text": issue_json}]}})
+        self.assertIn("o/r#10", ctx)
+        # Heredoc bodies with apostrophes and titles mentioning gh-proman still trigger.
+        ctx = self.hook(self.bash("gh pr create -t 'Add gh-proman config' --body-file - <<'EOF'\nIt's done\nEOF",
+                                  "https://github.com/o/r/pull/7", tool_use_id="r2"))
+        self.assertIn("you just opened PR o/r#7", ctx)
+        # Failed commands reported as text stay silent.
+        self.assertIsNone(self.hook(self.bash("gh pr merge 7", "Process exited with code 1", tool_use_id="r3")))
+        self.assertIsNone(self.hook(self.bash(
+            "gh pr create -t x", "a pull request for branch \"x\" already exists:\nhttps://github.com/o/r/pull/7",
+            tool_use_id="r4")))
+        # Non-GitHub MCP servers with the same tool names are ignored.
+        self.assertIsNone(self.hook({"tool_name": "mcp__linear__create_issue", "cwd": str(self.root),
+                                     "tool_input": {"title": "x"}, "tool_use_id": "r5",
+                                     "tool_response": "see https://github.com/o/r/issues/3"}))
+
     def test_other_repo_without_config_is_silent(self):
         ctx = self.hook(self.bash("gh issue create -R x/y -t t", "https://github.com/x/y/issues/1"))
         self.assertIsNone(ctx)
@@ -423,6 +452,13 @@ class SyncTests(Case):
         self.assertEqual(cands["o/r#2"]["link"], "refs")
         signals = {r["signal"] for r in cands["o/r#10"]["reasons"]}
         self.assertTrue({"linked", "task-id", "paths"} <= signals, signals)
+
+    def test_closing_keyword_takes_one_ref_and_task_id_matches_lowercase_branch(self):
+        self.add_pr(23, "Batch", body="Closes #11 and #12", head="codex/s03-deadline")
+        cands = {c["ref"]: c for c in self.cj("candidates", "--pr", "o/r#23")["candidates"]}
+        self.assertEqual(cands["o/r#11"]["link"], "closes")
+        self.assertEqual(cands["o/r#12"]["link"], "refs")
+        self.assertEqual(cands["o/r#10"]["link"], "closes")  # S03 from codex/s03-…
 
     def test_closing_keyword_and_path_overlap(self):
         self.add_pr(21, "CSV", body="Fixes #12", files=["src/export/csv.ts"])
@@ -560,6 +596,24 @@ class CloseTests(Case):
         out = self.close("--criteria-map", str(self.cmap), expect=3)
         self.assertIn("o/other#30", out["refused"])
 
+    def test_refuses_when_tracked_pr_merged_but_not_landed(self):
+        self.add_pr(31, "Dashboard side", slug="o/other", base="feat/x", state="MERGED", merge_sha="9" * 40,
+                    merged_at="2026-10-20T10:00:00Z")
+        body = self.state["repos"]["o/r"]["issues"]["10"]["body"]
+        self.state["repos"]["o/r"]["issues"]["10"]["body"] = (
+            '<!-- gh-proman:status:start -->\n<!-- gh-proman:state {"prs":[{"ref":"o/other#31","state":"merged",'
+            '"base":"feat/x","landed":[]}],"v":1} -->\n<!-- gh-proman:status:end -->\n\n' + body)
+        self.save()
+        out = self.close("--criteria-map", str(self.cmap), expect=3)
+        self.assertIn("o/other#31", out["refused"])
+
+    def test_teammate_agent_comment_counts_as_activity(self):
+        self.state["repos"]["o/r"]["issues"]["10"]["comments"] = [
+            {"id": 6, "user": {"login": "colleague"}, "created_at": "2026-10-21T09:00:00Z",
+             "body": "<!-- gh-proman:v1 event=note source=o/r#9 -->\nRestano i criteri 2-3"}]
+        self.save()
+        self.close("--criteria-map", str(self.cmap), expect=3)
+
     def test_dry_run_close_makes_no_mutations(self):
         res = self.close("--criteria-map", str(self.cmap), "--dry-run")
         self.assertEqual(res["action"], "would-close")
@@ -638,6 +692,46 @@ class CreateTests(Case):
         self.assertIn("secret", res["errors"][0])
         self.assertIn("missing section: ## Contesto", res["warnings"])
 
+    def org_priority(self, no_read_org=False):
+        self.state["orgs"] = {"o": {"no_read_org": no_read_org, "fields": [
+            {"id": "IFSS_1", "name": "Priority", "options": [{"id": f"o{i}", "name": n} for i, n in
+                                                            enumerate(["Urgent", "High", "Medium", "Low"])]}],
+            "types": [{"id": "IT_1", "name": "Task"}, {"id": "IT_2", "name": "Bug"}, {"id": "IT_3", "name": "Feature"}]}}
+        self.save()
+
+    def test_org_issue_field_priority_and_issue_type(self):
+        self.org_priority()
+        res = self.cj("create", "--type", "bug", "--title", "Crash", "--priority", "P1", "--confirm-new",
+                      "--body", self.BODY)
+        issue = self.issue(1)
+        self.assertEqual(issue["fields"], {"Priority": "High"})
+        self.assertEqual(issue["type"], "Bug")
+        self.assertEqual(res["board"]["priority"], {"level": "P1", "option": "High", "field": "issue:Priority"})
+        self.assertNotIn("Priority", self.item("o/r#1")["fields"])
+        self.cj("set-priority", "--issue", "o/r#1", "--priority", "P0")
+        self.assertEqual(self.issue(1)["fields"], {"Priority": "Urgent"})
+        setup = self.cj("project", "setup")
+        self.assertEqual(setup["priority"]["map"], {"P0": "Urgent", "P1": "High", "P2": "Medium", "P3": "Low"})
+        self.assertNotIn("GhpUpdateField", self.mutations())
+
+    def test_priority_map_overrides_standard_names(self):
+        self.org_priority()
+        self.write_config(priority={"map": {"P3": "Medium"}})
+        self.cj("create", "--type", "chore", "--title", "x", "--priority", "P3", "--confirm-new",
+                "--body", "## Contesto\nx\n\n## Attività\n- [ ] y\n\n## Verifica\n- [ ] z\n")
+        self.assertEqual(self.issue(1)["fields"], {"Priority": "Medium"})
+        self.assertEqual(self.issue(1)["type"], "Task")
+
+    def test_without_read_org_explains_instead_of_guessing(self):
+        self.org_priority(no_read_org=True)
+        out = self.cj("create", "--type", "bug", "--title", "x", "--priority", "P1", "--confirm-new",
+                      "--body", self.BODY, expect=2)
+        self.assertIn("read:org", out["error"])
+        self.assertEqual(self.mutations(), [])
+        doctor = self.cj("doctor", expect=1)
+        prio = next(c for c in doctor["checks"] if c["name"] == "priority field")
+        self.assertIn("read:org", prio["fix"])
+
     def test_set_status_never_moves_backwards(self):
         self.add_issue(1, "x", status="In review")
         self.assertEqual(self.cj("set-status", "--issue", "o/r#1", "--status", "in_progress")["action"], "skipped")
@@ -688,10 +782,13 @@ class AuditTests(Case):
                        created="2020-01-01T00:00:00Z")
         self.add_issue(11, "Nothing happened here", created="2020-01-01T00:00:00Z")
         self.add_issue(12, "Elsewhere", slug="o/other", body="Tocca https://github.com/o/r/issues/10")
-        sha = self.commit("fix(S03): scadenza comune\n\nCloses #10", "src/deadline.ts")
+        self.commit("fix(S03): scadenza comune\n\nCloses #10", "src/deadline.ts")
+        sha = self.commit("docs: readme", "README.md")
         self.git("update-ref", "refs/remotes/origin/dev", "HEAD")
         self.add_pr(50, "Web merge", body="", state="MERGED", base="dev", merge_sha=sha,
                     merged_at="2026-10-20T10:00:00Z", files=["README.md"])
+        self.state["repos"]["o/r"]["pulls"]["50"]["updated_at"] = "2026-10-20T10:00:00Z"
+        self.save()
         out = self.cj("audit-scan", "--no-fetch")
         issues = {i["ref"]: i for i in out["issues"]}
         self.assertEqual(set(issues), {"o/r#10", "o/r#11", "o/other#12"})
@@ -702,6 +799,32 @@ class AuditTests(Case):
         self.assertEqual(commit_ev["landed_in"], ["dev"])
         self.assertEqual(issues["o/r#11"]["suggested"], "none")
         self.assertEqual([p["ref"] for p in out["unsynced_merged_prs"]], ["o/r#50"])
+
+    def test_squash_merge_message_counts_for_the_pr(self):
+        self.add_issue(10, "Scadenze", created="2020-01-01T00:00:00Z")
+        sha = self.commit("Unifica scadenze (#51)\n\nCloses #10", "src/deadline.ts")
+        self.git("update-ref", "refs/remotes/origin/dev", "HEAD")
+        self.add_pr(51, "Unifica scadenze", state="MERGED", base="dev", merge_sha=sha,
+                    merged_at="2026-10-20T10:00:00Z", files=["src/deadline.ts"])
+        out = self.cj("audit-scan", "--no-fetch")
+        ev = out["issues"][0]["evidence"]
+        self.assertEqual([(e["kind"], e["ref"]) for e in ev], [("pr", "o/r#51")])  # not repeated as a commit
+        self.assertTrue(ev[0]["closes"])
+        self.assertEqual(out["unsynced_merged_prs"], [])
+
+    def test_merged_pr_paging_stops_on_updated_at(self):
+        self.add_issue(10, "Scadenze", created="2026-10-01T00:00:00Z")
+        self.state["page_size"] = 1
+        self.save()
+        old = self.add_pr(40, "Old but recently commented", state="MERGED", base="dev", merge_sha="e" * 40,
+                          merged_at="2025-01-01T00:00:00Z")
+        old["updated_at"] = "2026-10-21T09:00:00Z"
+        new = self.add_pr(41, "Fixes #10", body="Closes #10", state="MERGED", base="dev", merge_sha="f" * 40,
+                          merged_at="2026-10-20T00:00:00Z")
+        new["updated_at"] = "2026-10-20T00:00:00Z"
+        self.save()
+        out = self.cj("audit-scan", "--no-fetch")
+        self.assertEqual([e["ref"] for e in out["issues"][0]["evidence"]], ["o/r#41"])
 
     def test_watermark_from_status_block_skips_covered_history(self):
         sha = self.commit("fix: Closes #10", "src/deadline.ts")

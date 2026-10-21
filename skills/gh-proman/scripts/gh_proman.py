@@ -72,11 +72,18 @@ def now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
-def parse_time(value: str) -> dt.datetime:
-    value = value.strip().replace("Z", "+00:00")
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
-        value += "T00:00:00+00:00"
-    parsed = dt.datetime.fromisoformat(value)
+def parse_time(value) -> dt.datetime:
+    if not value:
+        raise Fail("missing date")
+    text = str(value).strip().replace("Z", "+00:00")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        text += "T00:00:00+00:00"
+    # Python < 3.11 accepts only 3 or 6 fractional digits.
+    text = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], text)
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        raise Fail(f"not a date: {value!r} (use YYYY-MM-DD or ISO 8601)")
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
 
 
@@ -232,9 +239,7 @@ def refs_in(text, default_slug=None):
 
 
 CLOSING_RE = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|chiude|chiudi|risolve)\b\s*:?\s+"
-                        r"((?:https://github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/\d+|(?:[\w-]+/[\w.-]+)?#\d+)"
-                        r"(?:\s*(?:,|and|e)\s*(?:https://github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/\d+|"
-                        r"(?:[\w-]+/[\w.-]+)?#\d+))*)", re.I)
+                        r"(https://github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/\d+|(?:[\w-]+/[\w.-]+)?#\d+)", re.I)
 
 
 def closing_refs_in(text, default_slug=None):
@@ -296,7 +301,9 @@ DEFAULTS = {
     "status_field": "Status",
     "draft_pr_status": "in_progress",
     "pr_status": "in_review",
-    "priority": {"field": "Priority", "options": ["P0", "P1", "P2", "P3"], "default": "P2"},
+    "priority": {"field": "Priority", "options": ["P0", "P1", "P2", "P3"], "default": "P2", "source": "auto",
+                 "map": {}},
+    "issue_types": {"bug": "Bug", "feature": "Feature", "chore": "Task"},
     "title_format": "[{id} · {priority}] {title}",
     "task_id_pattern": r"\b[A-Z]\d{2}(?:\.\d+)?\b",
     "status_block_position": "top",
@@ -496,7 +503,7 @@ def render_block(state: dict, cfg: dict) -> str:
             labels.append(f"{pr['ref']} ({label} → {pr.get('base', '?')})")
         lines.append(f"> {t['prs']}: " + ", ".join(labels))
     if state.get("criteria"):
-        lines.append(f"> {t['criteria']}: {state['criteria']}")
+        lines.append(f"> {t['criteria']}: {escape_ours(str(state['criteria']))}")
     covered = state.get("covered") or {}
     if covered:
         lines.append(f"> {t['covered']}: " + ", ".join(f"{repo}@{v.get('sha', '')[:7]}"
@@ -570,10 +577,21 @@ Q_MERGED = """query GhpMergedPulls($owner: String!, $repo: String!, $after: Stri
   repository(owner: $owner, name: $repo) {
     pullRequests(states: MERGED, first: 50, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
-      nodes { number title body url mergedAt headRefName baseRefName mergeCommit { oid }
+      nodes { number title body url mergedAt updatedAt headRefName baseRefName mergeCommit { oid }
         closingIssuesReferences(first: 25) { nodes { url number repository { nameWithOwner } } }
         files(first: 100) { nodes { path } }
         commits(last: 50) { nodes { commit { oid messageHeadline messageBody } } } } } } }"""
+
+Q_ORG_FIELDS = """query GhpOrgFields($owner: String!) {
+  organization(login: $owner) { issueFields(first: 50) { nodes { __typename
+    ... on IssueFieldSingleSelect { id name options { id name } } } } } }"""
+
+Q_ORG_TYPES = """query GhpOrgTypes($owner: String!) {
+  organization(login: $owner) { issueTypes(first: 50) { nodes { id name } } } }"""
+
+M_SET_ISSUE_FIELD = """mutation GhpSetIssueField($issue: ID!, $field: ID!, $option: ID!) {
+  setIssueFieldValue(input: {issueId: $issue, issueFields: [{fieldId: $field, singleSelectOptionId: $option}]}) {
+    issue { id } } }"""
 
 M_ADD_ITEM = """mutation GhpAddItem($project: ID!, $content: ID!) {
   addProjectV2ItemById(input: {projectId: $project, contentId: $content}) { item { id } } }"""
@@ -608,6 +626,27 @@ class Ctx:
         self._project = None
         self.actions = 0
         self.closes = 0
+        self._orgs = {}
+
+    def org_meta(self, owner):
+        """Org-level issue fields and issue types. Both need `read:org`; without it GitHub returns no fields and
+        refuses the types, so `error` says what's missing instead of pretending the org has none."""
+        if owner not in self._orgs:
+            meta = {"fields": {}, "types": None, "error": None}
+            try:
+                data = self.gh.graphql(Q_ORG_FIELDS, owner=owner)
+                nodes = (((data.get("organization") or {}).get("issueFields") or {}).get("nodes")) or []
+                meta["fields"] = {n["name"]: n for n in nodes if n and n.get("name")}
+            except Fail as exc:
+                meta["error"] = str(exc)
+            try:
+                data = self.gh.graphql(Q_ORG_TYPES, owner=owner)
+                nodes = (((data.get("organization") or {}).get("issueTypes") or {}).get("nodes")) or []
+                meta["types"] = {n["name"].lower(): n for n in nodes if n and n.get("name")}
+            except Fail as exc:
+                meta["error"] = meta["error"] or str(exc)
+            self._orgs[owner] = meta
+        return self._orgs[owner]
 
     @property
     def slug(self):
@@ -712,6 +751,64 @@ class Project:
             raise Fail(f"project {self.label} has no field {field_name!r}")
         self.gh.graphql(M_SET_FIELD, project=self.id, item=item_id, field=field["id"],
                         option=self.option_id(field_name, option_name))
+
+
+STANDARD_PRIORITIES = [("urgent", "critical", "highest", "p0"), ("high", "p1"), ("medium", "normal", "p2"),
+                       ("low", "lowest", "p3")]
+
+
+def priority_target(ctx, owner):
+    """Where Priority lives: ('issue', org issue field) or ('project', project field)."""
+    cfg = ctx.cfg()["priority"]
+    name, source = cfg["field"], cfg.get("source", "auto")
+    if source in ("auto", "issue"):
+        meta = ctx.org_meta(owner)
+        field = meta["fields"].get(name)
+        if field and field.get("__typename", "IssueFieldSingleSelect") == "IssueFieldSingleSelect":
+            return "issue", field
+        if source == "issue":
+            raise Fail(f"no org issue field {name!r} visible on {owner}" +
+                       (" (the token needs the read:org scope)" if meta["error"] or not meta["fields"] else ""))
+    field = ctx.project().field(name)
+    if not field:
+        raise Fail(f"project {ctx.project().label} has no field {name!r}; run `project setup`")
+    return "project", field
+
+
+def priority_option(ctx, field, level, where):
+    """The field option for P0..P3: config map, then an option named like the level, then the standard
+    Urgent/High/Medium/Low names by position."""
+    cfg = ctx.cfg()["priority"]
+    if level not in cfg["options"]:
+        raise Fail(f"priority must be one of {', '.join(cfg['options'])}")
+    options = field.get("options") or []
+    wanted = (cfg.get("map") or {}).get(level, level)
+    for opt in options:
+        if opt["name"].lower() == wanted.lower():
+            return opt
+    idx = cfg["options"].index(level)
+    if idx < len(STANDARD_PRIORITIES):
+        for opt in options:
+            if opt["name"].lower() in STANDARD_PRIORITIES[idx]:
+                return opt
+    hint = "run `project setup`" if where == "project" else "set priority.map in the config"
+    if where == "project" and not options:
+        hint += ("; if the board shows Priority values anyway, it's an org issue field and the token needs the "
+                 "read:org scope")
+    raise Fail(f"no option for {level} in {field.get('name')!r} ({where} field; has: "
+               f"{', '.join(o['name'] for o in options) or 'none'}); {hint}")
+
+
+def apply_priority(ctx, slug, node_id, item_id, level):
+    where, field = priority_target(ctx, slug.split("/")[0])
+    opt = priority_option(ctx, field, level, where)
+    ctx.count()
+    if where == "issue":
+        ctx.gh.graphql(M_SET_ISSUE_FIELD, issue=node_id, field=field["id"], option=opt["id"])
+    else:
+        ctx.project().gh.graphql(M_SET_FIELD, project=ctx.project().id, item=item_id, field=field["id"],
+                                 option=opt["id"])
+    return {"level": level, "option": opt["name"], "field": f"{where}:{field.get('name')}"}
 
 
 def status_key(cfg, name):
@@ -957,7 +1054,7 @@ def candidates(ctx, src, limit=10, mode="related", min_score=0.2, include_closed
     cfg = ctx.cfg()
     items = [i for i in ctx.project().items() if i.get("type") == "Issue"]
     default_slug = src["ref"].slug if src.get("ref") else ctx.slug
-    head_text = "\n".join([src.get("title") or "", src.get("branch") or ""] +
+    head_text = "\n".join([src.get("title") or "", (src.get("branch") or "").upper()] +
                           [c["message"].split("\n", 1)[0] for c in src.get("commits") or []])
     full_text = source_text(src)
     explicit_refs = refs_in(full_text, default_slug)
@@ -1114,7 +1211,7 @@ def status_block_upsert(ctx, ref, status=None, summary=None, prs=(), covered=Non
         if covered:
             state.setdefault("covered", {})[covered["repo"]] = {"sha": covered["sha"], "date": iso(now())}
         if criteria:
-            state["criteria"] = criteria
+            state["criteria"] = escape_ours(str(criteria)).replace("-->", "--&gt;")
         state["updated"] = iso(now())
         new = put_block(body, render_block(state, ctx.cfg()), ctx.cfg()["status_block_position"])
         if strip_block(new) != strip_block(body):
@@ -1175,9 +1272,7 @@ def ensure_on_board(ctx, ref, node_id=None, project_items=None, status=None, pri
     if status:
         result["status"] = move_status(ctx, item_id, current, status)
     if priority:
-        ctx.count()
-        project.set_option(item_id, ctx.cfg()["priority"]["field"], priority)
-        result["priority"] = priority
+        result["priority"] = apply_priority(ctx, ref.slug, node_id, item_id, priority)
     return result
 
 
@@ -1217,14 +1312,13 @@ def set_priority(ctx, ref, priority):
     if not item_id:
         ctx.count()
         item_id = ctx.project().add(issue["id"])
-    ctx.count()
-    ctx.project().set_option(item_id, cfg["priority"]["field"], priority)
+    applied = apply_priority(ctx, ref.slug, issue["id"], item_id, priority)
     title = issue["title"]
     new_title = re.sub(r"^(\[[^\]·]+·\s*)P\d(\s*\])", lambda m: m.group(1) + priority + m.group(2), title)
     if new_title != title:
         ctx.count()
         ctx.gh.rest(f"repos/{ref.slug}/issues/{ref.number}", "PATCH", {"title": new_title})
-    return {"issue": ref.short, "priority": priority, "title": new_title}
+    return {"issue": ref.short, "priority": applied, "title": new_title}
 
 
 # ---------------------------------------------------------------------------------------------- close
@@ -1240,7 +1334,7 @@ def explicit_link(ctx, issue_ref, pr, issue_title=None):
     if any(issue_ref.same(r) for r in closing_refs_in(text, slug)):
         return "closing-keyword"
     iid = title_id(ctx.cfg(), issue_title) if issue_title else None
-    if iid and iid in task_ids(ctx.cfg(), (pr.get("title") or "") + "\n" + (pr.get("headRefName") or "")):
+    if iid and iid in task_ids(ctx.cfg(), (pr.get("title") or "") + "\n" + (pr.get("headRefName") or "").upper()):
         return "task-id"
     return None
 
@@ -1265,7 +1359,7 @@ def close_issue(ctx, ref, reason, comment, evidence=(), criteria_map=None, dupli
     me = ctx.gh.viewer()
 
     if not ack_activity:
-        recent = [c for c in comments if (c.get("user") or {}).get("login") != me and not parse_marker(c.get("body"))
+        recent = [c for c in comments if (c.get("user") or {}).get("login") != me
                   and now() - parse_time(c["created_at"]) < dt.timedelta(hours=24)]
         if recent:
             problems.append(f"{len(recent)} comment(s) from others in the last 24 hours: read them, then pass "
@@ -1327,7 +1421,8 @@ def close_issue(ctx, ref, reason, comment, evidence=(), criteria_map=None, dupli
                 problems.append(f"evidence {ev!r} is neither a PR nor a commit URL")
         tracked = block_state(issue.get("body") or "").get("prs") or []
         for p in tracked:
-            if p.get("state") != "merged" and not any(p["ref"] == e["evidence"] for e in landed_evidence):
+            if (p.get("state") != "merged" or not p.get("landed")) and \
+                    not any(p["ref"] == e["evidence"] for e in landed_evidence):
                 fresh = pr_entry(ctx, parse_ref(p["ref"], ref.slug, "pr"))
                 if fresh["state"] != "merged" or not fresh.get("landed"):
                     problems.append(f"{p['ref']}, tracked in the status block, has not landed yet")
@@ -1447,8 +1542,12 @@ def cmd_doctor(ctx, args):
         return ok, line, "upgrade gh to 2.48+ (needs `gh api --slurp`)"
     check("gh", gh_version)
 
+    logged_in = []
+
     def auth():
         rc, out, err = run(["gh", "api", "user", "--jq", ".login"], check=False)
+        if rc == 0:
+            logged_in.append(out.strip())
         env_token = bool(os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"))
         if rc != 0:
             fix = ("GITHUB_TOKEN/GH_TOKEN in this shell is invalid and overrides the keyring login: unset it or "
@@ -1460,16 +1559,16 @@ def cmd_doctor(ctx, args):
         block = next((b for b in active if "Active account: true" in b), text)
         scopes = re.search(r"Token scopes: (.*)", block)
         scope_set = set(re.findall(r"'([\w:]+)'", scopes.group(1))) if scopes else set()
-        missing = [s for s in ("repo", "project") if scope_set and s not in scope_set]
+        missing = [s for s in ("repo", "project", "read:org") if scope_set and s not in scope_set]
         source = "env GITHUB_TOKEN/GH_TOKEN" if env_token else "keyring"
         detail = f"{out.strip()} via {source}; scopes: {', '.join(sorted(scope_set)) or 'unknown (fine-grained?)'}"
         fix = None
         if missing:
-            fix = (f"missing scopes {', '.join(missing)}: " +
-                   ("replace the env token (gh auth refresh only fixes the keyring login)" if env_token
-                    else "gh auth refresh -s project"))
+            fix = (f"missing scopes {', '.join(missing)} (read:org is needed for org issue fields and types): " +
+                   ("add them to the env token or unset it (gh auth refresh only fixes the keyring login)"
+                    if env_token else "gh auth refresh -s project,read:org"))
         return not missing, detail, fix
-    authed = check("auth", auth)
+    check("auth", auth)
 
     check("repo", lambda: (bool(ctx.repo.root), f"{ctx.repo.root} ({ctx.repo.slug or 'no GitHub origin'})",
                            "run inside the repository or pass -C <dir>"))
@@ -1480,7 +1579,7 @@ def cmd_doctor(ctx, args):
                      f"language {cfg['language']}", None
     configured = check("config", config)
 
-    if configured and authed:
+    if configured and logged_in:
         def project():
             p = ctx.project()
             return True, f"{p.label} ({len(p.fields)} fields)", None
@@ -1497,11 +1596,24 @@ def cmd_doctor(ctx, args):
             check("status field", status_field)
 
             def priority_field():
-                f = p.field(cfg["priority"]["field"])
-                names = [o["name"] for o in (f or {}).get("options") or []]
-                missing = [v for v in cfg["priority"]["options"] if v not in names]
-                return not missing, f"{cfg['priority']['field']}: {', '.join(names) or 'no options'}", \
-                    ("run `project setup` (ask the user first)" if missing else None)
+                owner = (ctx.repo.slug or f"{p.owner}/x").split("/")[0]
+                where, f = priority_target(ctx, owner)
+                mapping, missing = {}, []
+                for lvl in cfg["priority"]["options"]:
+                    try:
+                        mapping[lvl] = priority_option(ctx, f, lvl, where)["name"]
+                    except Fail:
+                        missing.append(lvl)
+                detail = f"{where} field {f.get('name')}: " + ", ".join(f"{k}→{v}" for k, v in mapping.items())
+                if missing:
+                    detail += f"; no option for {', '.join(missing)}"
+                fix = None
+                if missing:
+                    fix = ("run `project setup` (ask the user first)" if where == "project" else
+                           "map the levels to the org field's options with priority.map in the config")
+                    if where == "project" and not f.get("options") and ctx.org_meta(owner)["error"]:
+                        fix += "; or, if Priority is an org issue field, add the read:org scope to the token"
+                return not missing, detail, fix
             check("priority field", priority_field)
 
         if ctx.repo.slug:
@@ -1565,10 +1677,18 @@ def cmd_project_setup(ctx, args):
     cfg, p = ctx.cfg(), ctx.project()
     t = I18N[ctx.lang]
     report = {"project": p.label, "created": [], "added_options": [], "missing_status": []}
-    wanted = cfg["priority"]["options"]
+    where, ifield = priority_target(ctx, p.owner) if cfg["priority"].get("source", "auto") != "project" \
+        else ("project", None)
+    if where == "issue":
+        mapping = {lvl: priority_option(ctx, ifield, lvl, "issue")["name"] for lvl in cfg["priority"]["options"]}
+        report["priority"] = {"field": f"org issue field {ifield['name']}", "map": mapping,
+                              "note": "Priority is an organization issue field; nothing to create on the board"}
+        wanted = []
+    else:
+        wanted = cfg["priority"]["options"]
     new_opts = [{"name": n, "color": PRIORITY_COLORS.get(n, "GRAY"), "description": t["priority_desc"].get(n, "")}
                 for n in wanted]
-    field = p.field(cfg["priority"]["field"])
+    field = p.field(cfg["priority"]["field"]) if wanted else {"dataType": "SINGLE_SELECT", "options": []}
     if not field:
         p.gh.graphql(M_CREATE_FIELD, project=p.id, name=cfg["priority"]["field"], options=new_opts)
         report["created"].append(cfg["priority"]["field"])
@@ -1579,7 +1699,7 @@ def cmd_project_setup(ctx, args):
         existing = field.get("options") or []
         have = {o["name"] for o in existing}
         missing = [o for o in new_opts if o["name"] not in have]
-        if missing:
+        if missing and wanted:
             # The mutation replaces the whole option list; sending existing ids keeps current values intact.
             keep = [{"id": o["id"], "name": o["name"], "color": o.get("color") or "GRAY",
                      "description": o.get("description") or ""} for o in existing]
@@ -1653,8 +1773,23 @@ def cmd_create(ctx, args):
         raise Refused("the body failed lint: " + "; ".join(lint["errors"]), {"lint": lint})
     title = format_title(cfg, args.title, priority, args.id)
     project = ctx.project()
-    project.option_id(cfg["priority"]["field"], priority)  # fail before creating anything
+    # Fail before creating anything.
+    where, pfield = priority_target(ctx, slug.split("/")[0])
+    priority_option(ctx, pfield, priority, where)
     project.option_id(cfg["status_field"], cfg["status"][args.status])
+    warnings = []
+    type_name = (cfg.get("issue_types") or {}).get(args.type)
+    if type_name:
+        meta = ctx.org_meta(slug.split("/")[0])
+        if meta["types"] is None:
+            warnings.append(f"issue type not set: org issue types are not readable ({meta['error'] or 'no access'}"
+                            "; the token needs read:org)")
+            type_name = None
+        elif type_name.lower() not in meta["types"]:
+            warnings.append(f"issue type {type_name!r} does not exist in {slug.split('/')[0]}; not set")
+            type_name = None
+        else:
+            type_name = meta["types"][type_name.lower()]["name"]
     if not args.confirm_new:
         dups = candidates(ctx, source_from_text(args.title, body), limit=5, mode="duplicate", min_score=0.3)
         threshold = float(cfg.get("duplicate_threshold", 0.5))
@@ -1664,12 +1799,17 @@ def cmd_create(ctx, args):
                                "--confirm-new if it really is new"})
             return 3
     ctx.count()
-    data = ctx.gh.rest(f"repos/{slug}/issues", "POST", {"title": title, "body": body})
+    payload = {"title": title, "body": body}
+    if type_name:
+        payload["type"] = type_name
+    data = ctx.gh.rest(f"repos/{slug}/issues", "POST", payload)
     if ctx.gh.dry_run:
-        emit(ctx, {"would_create": {"repo": slug, "title": title}, "lint": lint})
+        emit(ctx, {"would_create": {"repo": slug, "title": title, "type": type_name}, "lint": lint,
+                   "warnings": warnings})
         return 0
     ref = Ref(*slug.split("/", 1), data["number"], "issue")
-    res = {"url": data["html_url"], "ref": ref.short, "title": title, "lint_warnings": lint["warnings"]}
+    res = {"url": data["html_url"], "ref": ref.short, "title": title, "type": type_name,
+           "lint_warnings": lint["warnings"], "warnings": warnings}
     res["board"] = ensure_on_board(ctx, ref, node_id=data["node_id"], project_items=[], status=args.status,
                                    priority=priority)
     if args.parent:
@@ -1895,7 +2035,7 @@ def cmd_audit_scan(ctx, args):
         own_source = re.compile(rf"^{re.escape(slug)}[#@]", re.I)
         ours = [m for m in marks if m.get("sha") and own_source.match(m.get("source") or "")]
         if cov:
-            wm = {"sha": cov.get("sha"), "date": cov.get("date"), "source": "status block"}
+            wm = {"sha": cov.get("sha"), "date": cov.get("date") or it.get("createdAt"), "source": "status block"}
         elif ours:
             wm = {"sha": ours[-1]["sha"], "date": ours[-1]["date"], "source": f"marker {ours[-1].get('event')}"}
         else:
@@ -1912,9 +2052,10 @@ def cmd_audit_scan(ctx, args):
         page = data["repository"]["pullRequests"]
         stop = False
         for pr in page["nodes"]:
+            # Pages are ordered by updatedAt, so only that field can end the scan.
             if pr.get("mergedAt") and parse_time(pr["mergedAt"]) >= oldest:
                 merged.append(pr)
-            elif pr.get("mergedAt"):
+            if pr.get("updatedAt") and parse_time(pr["updatedAt"]) < oldest:
                 stop = True
         if stop or not page["pageInfo"]["hasNextPage"] or len(merged) > 300:
             break
@@ -1925,6 +2066,8 @@ def cmd_audit_scan(ctx, args):
         sha = (pr.get("mergeCommit") or {}).get("oid")
         pr["_landed"] = [b for b, h in heads.items() if pr["baseRefName"] == b or
                          (sha and repo.ok("merge-base", "--is-ancestor", sha, h["ref"]))]
+        # A squash merge's message usually carries the PR's Closes/Refs lines: count it as part of the PR.
+        pr["_merge_message"] = repo.git("log", "-1", "--format=%B", sha, check=False) if sha else ""
 
     commit_cache = {}
 
@@ -1972,19 +2115,20 @@ def cmd_audit_scan(ctx, args):
             reasons = []
             if any(ref.same(parse_ref(n["url"])) for n in pr["closingIssuesReferences"]["nodes"]):
                 reasons.append("linked")
-            text = "\n".join([pr["title"], pr.get("body") or "", pr["headRefName"]] +
+            text = "\n".join([pr["title"], pr.get("body") or "", pr["headRefName"], pr.get("_merge_message", "")] +
                              [n["commit"]["messageHeadline"] + "\n" + (n["commit"].get("messageBody") or "")
                               for n in pr["commits"]["nodes"]])
             if any(ref.same(r) for r in closing_refs_in(text, slug)):
                 reasons.append("closing-keyword")
             elif any(ref.same(r) for r in refs_in(text, slug)):
                 reasons.append("explicit-ref")
-            if iid and iid in task_ids(cfg, pr["title"] + "\n" + pr["headRefName"]):
+            if iid and iid in task_ids(cfg, pr["title"] + "\n" + pr["headRefName"].upper()):
                 reasons.append(f"task-id {iid}")
             hits = path_overlap(ipaths, [n["path"] for n in pr["files"]["nodes"]])
             if hits:
                 reasons.append("paths " + ", ".join(hits[:3]))
-            if pr["url"] in body or pr["headRefName"] in body:
+            head = pr["headRefName"]
+            if pr["url"] in body or (len(head) > 4 and head not in heads and head in body):
                 reasons.append("mentioned-by-issue")
             if reasons:
                 evidence.append({"kind": "pr", "ref": f"{slug}#{pr['number']}", "title": pr["title"],
@@ -1997,6 +2141,8 @@ def cmd_audit_scan(ctx, args):
         pr_shas = set()
         for pr in merged:
             pr_shas |= {n["commit"]["oid"] for n in pr["commits"]["nodes"]}
+            if (pr.get("mergeCommit") or {}).get("oid"):
+                pr_shas.add(pr["mergeCommit"]["oid"])
         for c in commits_since(wm):
             if c["sha"] in pr_shas:
                 continue

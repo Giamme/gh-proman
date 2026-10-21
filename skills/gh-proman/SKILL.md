@@ -27,7 +27,7 @@ Run `doctor`. It checks:
 
 Relay any `fix` lines to the user. Common ones:
 - **Bad credentials from an env token.** An exported `GITHUB_TOKEN` overrides the keyring login. The user should unset or replace it; `gh auth refresh` does not help in that case.
-- **Missing `project` scope:** `gh auth refresh -s project`. The user runs it themselves with `! gh auth refresh -s project`.
+- **Missing `project` or `read:org` scope:** `gh auth refresh -s project,read:org`. The user runs it themselves with `! gh auth refresh -s project,read:org`. Without `read:org`, an organisation's Priority issue field and issue types are invisible.
 
 Then run `config show` to learn the board, the language and the integration branches.
 
@@ -39,7 +39,11 @@ Then run `config show` to learn the board, the language and the integration bran
    - the integration branches whose merges count as done (e.g. `dev`, `dev-deb`, plus the default branch);
    - whether the config goes in the repo (`.github/gh-proman.json`, shared with the team) or in the user's profile (`--user`, matched by owner).
 2. Run `config init --owner <o> --number <n> --language <l> --branches dev,@default [--user]`.
-3. Run `project setup --dry-run`, show the user what it will add (Priority options P0–P3), and run it for real once they agree. It never rewrites Status options and keeps existing options' ids.
+3. Run `project setup --dry-run` and show the user what it will do:
+   - When Priority is an organisation issue field (e.g. Urgent/High/Medium/Low), nothing is created; it shows how P0–P3 map to the org's options.
+   - Otherwise it adds the options P0–P3 to the board's Priority field.
+
+   Run it for real once they agree. It never rewrites Status options and keeps existing options' ids.
 4. Run `doctor` again. `references/config.md` has every key, including how to point a repo at an external client's board.
 
 ## Create an issue
@@ -50,7 +54,10 @@ Then run `config show` to learn the board, the language and the integration bran
    - the house style already used on the board.
 2. Link code with `permalink <path>[:line[-line]]`. It refuses unpushed SHAs, and branch links rot. Link related issues as `Refs owner/repo#N`.
 3. Write the body to a file and run `lint-body --type <type> --body-file <file>`. Fix the errors; the warnings are judgment calls.
-4. Run `create --type <type> --title "<title>" --body-file <file> --priority P<n> [--id S12] [--parent <issue>]`. It adds the issue to the board with Status Backlog and the priority.
+4. Run `create --type <type> --title "<title>" --body-file <file> --priority P<n> [--id S12] [--parent <issue>]`. It:
+   - sets the organisation's issue type (Bug, Feature or Task) when the org has one;
+   - adds the issue to the board with Status Backlog;
+   - sets the priority, on the org issue field or the board field, wherever Priority lives.
 5. **Duplicate guard.** If `create` exits 3 with candidates, show them to the user. Offer to comment on or extend the existing issue instead (`comment --event issue-related`, or ask the owner). Pass `--confirm-new` only after the user says it really is new.
 
 Several related tasks: create a parent issue and its children with `--parent`, so the board shows sub-issue progress.

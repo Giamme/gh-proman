@@ -7,7 +7,6 @@
         "hooks": [
           {
             "type": "command",
-            "if": "Bash(gh *)",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/gh-proman/scripts/hook.py\"",
             "timeout": 15
           }

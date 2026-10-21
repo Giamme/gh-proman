@@ -22,7 +22,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gh_proman as gp  # noqa: E402
 
-MCP_TOOL = re.compile(r"^mcp__.+__(?:github_)?(create_issue|issue_write|create_pull_request|merge_pull_request)$")
+MCP_TOOL = re.compile(r"^mcp__.+__(?:github_)?(create_issue|issue_write|create_pull_request|merge_pull_request)$",
+                      re.I)
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\s*(?=\n|$)", re.S)
+FAILED_TEXT = re.compile(r"(?:exit(?:ed)?(?: with)? (?:status|code)|exit_code)[:= ]+([1-9]\d*)|already exists|"
+                         r"^(?:error|fatal|GraphQL):", re.I | re.M)
+MERGED_TEXT = re.compile(r"pull request (?:([\w.-]+/[\w.-]+))?#(\d+)", re.I)
+OWN_COMMANDS = ("gh_proman.py", "gh-proman", "hook.py")
 SHELLS = {"bash", "sh", "zsh", "/bin/bash", "/bin/sh", "/bin/zsh", "/usr/bin/bash", "/usr/bin/zsh"}
 OPERATORS = {"&&", "||", ";", "|", "&", "(", ")", "\n"}
 VALUE_FLAGS = {"-R", "--repo", "-b", "--body", "-F", "--body-file", "-t", "--title", "-B", "--base", "-H", "--head",
@@ -42,6 +48,7 @@ def command_text(tool_input) -> str:
 
 
 def tokenize(command):
+    command = HEREDOC.sub(" ", command)  # heredoc bodies are data, and their quotes break shlex
     try:
         lex = shlex.shlex(re.sub(r"\\\n", " ", command).replace("\n", " ; "), posix=True,
                           punctuation_chars=";&|()")
@@ -49,7 +56,8 @@ def tokenize(command):
         lex.commenters = ""
         return list(lex)
     except ValueError:
-        return []
+        # Unbalanced quotes: fall back to whitespace splitting, enough to spot `gh <noun> <verb>`.
+        return re.findall(r"&&|\|\||[;&|()]|[^\s;&|()]+", command)
 
 
 def gh_invocations(command, cwd: Path):
@@ -58,6 +66,14 @@ def gh_invocations(command, cwd: Path):
     tokens = tokenize(command)
     here = cwd
     i = 0
+    starts = {0} | {n + 1 for n, t in enumerate(tokens) if t in OPERATORS}
+    for n in sorted(starts):
+        # Our own CLI (or `python3 .../gh_proman.py`) writes to issues itself: never remind about it.
+        lead = tokens[n:n + 2]
+        if lead and (os.path.basename(lead[0]) in OWN_COMMANDS or
+                     (lead[0].startswith("python") and len(lead) > 1 and os.path.basename(lead[1]) in OWN_COMMANDS)
+                     or lead == ["gh", "proman"]):
+            return []
     while i < len(tokens):
         tok = tokens[i]
         if tok == "cd" and i + 1 < len(tokens) and tokens[i + 1] not in OPERATORS:
@@ -134,16 +150,35 @@ def failed(response) -> bool:
                 return True
         if response.get("is_error") or response.get("isError") or response.get("interrupted"):
             return True
+        text = "\n".join(str(response.get(k) or "") for k in ("stderr", "output", "error"))
+        return bool(FAILED_TEXT.search(text)) if "stdout" not in response or response.get("stderr") else False
+    if isinstance(response, str):
+        return bool(FAILED_TEXT.search(response))
     return False
 
 
-def urls_in(response, kind):
-    out = []
-    for text in strings(response):
-        for m in gp.URL_RE.finditer(text):
-            if (m.group(3) == "pull") == (kind == "pr"):
-                out.append(m.group(0))
-    return out
+def created_url(response, kind):
+    """URL of the item a tool created. Structured responses (MCP) carry it as html_url/url on the object itself;
+    URLs inside its body or title belong to other items, so they are only a last resort. gh prints the URL last."""
+    want = "pull" if kind == "pr" else "issues"
+    queue = [response]
+    while queue:
+        value = queue.pop(0)
+        if isinstance(value, str) and value.strip()[:1] in "{[":
+            try:
+                value = json.loads(value)
+            except ValueError:
+                continue
+        if isinstance(value, dict):
+            for key in ("html_url", "url"):
+                m = gp.URL_RE.fullmatch(str(value.get(key) or ""))
+                if m and m.group(3) == want:
+                    return m.group(0)
+            queue += [v for k, v in value.items() if k not in ("body", "title", "description")]
+        elif isinstance(value, list):
+            queue += value
+    found = [m.group(0) for text in strings(response) for m in gp.URL_RE.finditer(text) if m.group(3) == want]
+    return found[-1] if found else None
 
 
 def seen(key, store: Path) -> bool:
@@ -175,6 +210,8 @@ def detect(payload):
     cwd = Path(payload.get("cwd") or os.getcwd())
 
     m = MCP_TOOL.match(tool)
+    if m and "github" not in tool.lower():
+        return None  # Linear, Jira, GitLab… servers use the same tool names
     if m:
         action = m.group(1)
         if action == "issue_write" and (tool_input.get("method") or "create") != "create":
@@ -189,15 +226,15 @@ def detect(payload):
                 return None
             return {"event": "pr-merged", "selector": str(number), "repo": slug, "cwd": cwd}
         kind = "pr" if action == "create_pull_request" else "issue"
-        found = urls_in(response, kind)
-        if not found:
+        url = created_url(response, kind)
+        if not url:
             return None
         event = "pr-opened" if kind == "pr" else "issue-created"
-        return {"event": event, "url": found[-1], "repo": slug, "cwd": cwd, "body": tool_input.get("body"),
+        return {"event": event, "url": url, "repo": slug, "cwd": cwd, "body": tool_input.get("body"),
                 "body_known": kind == "pr"}
 
     command = command_text(tool_input)
-    if not command or "gh_proman" in command or "gh-proman" in command or "gh proman" in command:
+    if not command:
         return None
     for action, args, here in reversed(gh_invocations(command, cwd)):
         if "--web" in args or "-w" in args or "--dry-run" in args:
@@ -206,13 +243,24 @@ def detect(payload):
         if action == "pr merge":
             if failed(response):
                 return None
-            return {"event": "pr-merged", "selector": positional(args), "repo": repo, "cwd": here,
+            selector = positional(args)
+            merged = [m for t in strings(response) for m in MERGED_TEXT.finditer(t)]
+            if not selector and merged:
+                selector = f"{merged[-1].group(1)}#{merged[-1].group(2)}" if merged[-1].group(1) \
+                    else merged[-1].group(2)
+            if not selector:
+                # No number: gh merged the current branch's PR. Name the branch now; it may be deleted next.
+                branch = gp.Repo(here).git("rev-parse", "--abbrev-ref", "HEAD", check=False)
+                selector = branch if branch and branch != "HEAD" else None
+            return {"event": "pr-merged", "selector": selector, "repo": repo, "cwd": here,
                     "auto": "--auto" in args}
         kind = "pr" if action == "pr create" else "issue"
-        found = urls_in(response, kind)
-        if not found:
+        if failed(response):
             return None
-        info = {"event": "pr-opened" if kind == "pr" else "issue-created", "url": found[-1], "repo": repo,
+        url = created_url(response, kind)
+        if not url:
+            return None
+        info = {"event": "pr-opened" if kind == "pr" else "issue-created", "url": url, "repo": repo,
                 "cwd": here}
         if kind == "pr":
             body = flag(args, "-b", "--body")
@@ -236,7 +284,11 @@ def context_for(info, cfg, script):
     lang = {"it": "Italian", "en": "English"}[cfg["language"]]
     board = f"{cfg['project']['owner']}/{cfg['project']['number']}"
     if info["event"] == "pr-merged":
-        target = info["url"] if info.get("url") else (info.get("selector") or "<current branch>")
+        target = info.get("url") or info.get("selector")
+        if not target:
+            return ("gh-proman: you just merged a PR but its number is unknown. Find it with `gh pr list --state "
+                    "merged --limit 1 --json url`, then run "
+                    f"`python3 \"{script}\" sync --source <url> --event pr-merged --apply --json`.")
         repo_arg = f" --repo {info['repo']}" if info.get("repo") else ""
         if info.get("auto"):
             return (f"gh-proman: auto-merge was enabled for {target}. Nothing to sync yet; when it actually merges, "

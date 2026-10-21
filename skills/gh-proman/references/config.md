@@ -22,7 +22,10 @@ When both exist, the repo file is merged over the matched profile, key by key. `
 | `status` | Backlog / Ready / In progress / In review / Done | Board option names for the keys `backlog`, `ready`, `in_progress`, `in_review`, `done` |
 | `status_field` | `Status` | Name of the Status field |
 | `pr_status`, `draft_pr_status` | `in_review`, `in_progress` | Status set on linked issues when a PR (or draft PR) opens |
-| `priority.field`, `priority.options`, `priority.default` | `Priority`, P0–P3, `P2` | The Priority single-select field |
+| `priority.field`, `priority.options`, `priority.default` | `Priority`, P0–P3, `P2` | The Priority field, and the levels agents use |
+| `priority.source` | `auto` | `auto`: the organisation's issue field named `priority.field` if there is one, else the board's project field. `issue` / `project` force one |
+| `priority.map` | `{}` | Level → option name, e.g. `{"P0": "Urgent"}`. Without it, an option named like the level is used, else the standard names by position (Urgent/Critical, High, Medium/Normal, Low) |
+| `issue_types` | bug→Bug, feature→Feature, chore→Task | Organisation issue type set by `create`; skipped with a warning if the org has no such type |
 | `title_format` | `[{id} · {priority}] {title}` | Title when `create --id` is given; without an ID the title is used as is |
 | `task_id_pattern` | `\b[A-Z]\d{2}(?:\.\d+)?\b` | Task IDs (`S03`, `T01.2`) recognised in titles, branches and commits |
 | `status_block_position` | `top` | Where a new status block goes in an issue body (`top` / `bottom`) |
@@ -62,8 +65,14 @@ A repo that tracks its work on an external client's board, in English:
 
 Integration branches that don't exist in a given repo are ignored there. `doctor` lists them as "not in this repo".
 
+## Priority: board field or organisation issue field
+
+Organisations can define **issue fields** (Settings → Issues → Fields), such as a Priority with Urgent/High/Medium/Low. A board then shows that field as a read-only mirror: it can't be edited as a project field, and `project setup` leaves it alone. gh-proman detects this and writes the priority on the issue itself, mapping P0–P3 to the org's options; `doctor` prints the mapping. Agents keep saying P0–P3, and titles keep the `[S03 · P0]` prefix.
+
+When the board has its own Priority field instead (or none), `project setup` adds the options P0–P3 to it, keeping any existing options' ids so items keep their values.
+
 ## Auth
 
-gh-proman uses the GraphQL API for boards, so the token needs the `repo` and `project` scopes (`read:org` is not required). Two pitfalls:
+gh-proman uses the GraphQL API, so the token needs the `repo`, `project` and `read:org` scopes. Without `read:org`, GitHub silently hides the organisation's issue fields and refuses its issue types. `doctor` checks all three. Two pitfalls:
 - An exported `GITHUB_TOKEN` or `GH_TOKEN` overrides `gh`'s keyring login. When it is stale, every call fails with "Bad credentials", and `gh auth refresh` doesn't help: unset or replace the variable.
 - Fine-grained tokens need "Projects: read and write" on the organisation, plus "Issues" and "Pull requests" read/write on each repo.

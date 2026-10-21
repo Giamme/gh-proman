@@ -195,14 +195,20 @@ def graphql(state, payload):
     if op == "GhpMergedPulls":
         slug = f"{v['owner']}/{v['repo']}"
         prs = [p for p in repo(state, slug).get("pulls", {}).values() if p["state"] == "MERGED"]
-        prs.sort(key=lambda p: p.get("merged_at") or "", reverse=True)
+        prs.sort(key=lambda p: p.get("updated_at") or p.get("merged_at") or "", reverse=True)
         nodes = []
         for pr in prs:
             g = gql_pull(state, slug, pr)
-            nodes.append({k: g[k] for k in ("number", "title", "body", "url", "mergedAt", "headRefName", "baseRefName",
-                                            "mergeCommit", "closingIssuesReferences", "files", "commits")})
-        out({"data": {"repository": {"pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None},
-                                                      "nodes": nodes}}}})
+            node = {k: g[k] for k in ("number", "title", "body", "url", "mergedAt", "headRefName", "baseRefName",
+                                      "mergeCommit", "closingIssuesReferences", "files", "commits")}
+            node["updatedAt"] = pr.get("updated_at") or pr.get("merged_at")
+            nodes.append(node)
+        size = state.get("page_size", 50)
+        start = int(v.get("after") or 0)
+        has_next = start + size < len(nodes)
+        out({"data": {"repository": {"pullRequests": {
+            "pageInfo": {"hasNextPage": has_next, "endCursor": str(start + size) if has_next else None},
+            "nodes": nodes[start:start + size]}}}})
     if op == "GhpAddItem":
         p = project_by_id(state, v["project"])
         kind, slug, node = find_node(state, v["content"])
@@ -252,6 +258,28 @@ def graphql(state, payload):
         parent.setdefault("sub_issues", []).append(v["child"])
         save(state)
         out({"data": {"addSubIssue": {"issue": {"id": parent["node_id"]}}}})
+    if op in ("GhpOrgFields", "GhpOrgTypes"):
+        org = state.get("orgs", {}).get(v["owner"])
+        if org is None:
+            out({"data": {"organization": None}})
+        if org.get("no_read_org"):
+            if op == "GhpOrgTypes":
+                fail("gh: me does not have permission to retrieve issueType information.")
+            out({"data": {"organization": {"issueFields": {"nodes": []}}}})
+        if op == "GhpOrgFields":
+            out({"data": {"organization": {"issueFields": {"nodes": [
+                {"__typename": "IssueFieldSingleSelect", **f} for f in org.get("fields", [])]}}}})
+        out({"data": {"organization": {"issueTypes": {"nodes": org.get("types", [])}}}})
+    if op == "GhpSetIssueField":
+        _, _, issue = find_node(state, v["issue"])
+        for org in state.get("orgs", {}).values():
+            for f in org.get("fields", []):
+                if f["id"] == v["field"]:
+                    opt = next(o for o in f["options"] if o["id"] == v["option"])
+                    issue.setdefault("fields", {})[f["name"]] = opt["name"]
+                    save(state)
+                    out({"data": {"setIssueFieldValue": {"issue": {"id": issue["node_id"]}}}})
+        fail("field not found")
     fail(f"fake gh: unknown GraphQL operation {op}")
 
 
@@ -294,6 +322,8 @@ def rest(state, method, path, payload):
         stamp = tick(state)
         issue = {"number": n, "node_id": next_id(state, "I_"), "title": payload["title"], "body": payload.get("body", ""),
                  "state": "OPEN", "author": state["viewer"], "created_at": stamp, "updated_at": stamp, "comments": []}
+        if payload.get("type"):
+            issue["type"] = payload["type"]
         r.setdefault("issues", {})[str(n)] = issue
         save(state)
         out(rest_issue(slug, issue))

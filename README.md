@@ -57,7 +57,7 @@ Install the skill in one place per agent: with the Claude Code plugin installed,
 ### Requirements
 
 - Python 3.9+
-- `gh` 2.48+, authenticated with the `repo` and `project` scopes (`gh auth refresh -s project`)
+- `gh` 2.48+, authenticated with the `repo`, `project` and `read:org` scopes (`gh auth refresh -s project,read:org`)
 
 Watch out for a stale exported `GITHUB_TOKEN`: it overrides the keyring login. `gh-proman doctor` tells you which token is in use.
 
@@ -83,7 +83,12 @@ gh-proman does nothing in a repository until a config applies, and the hook stay
 
 Any repo can point at another board (an external client's project) with its own `.github/gh-proman.json`. All keys are in `skills/gh-proman/references/config.md`.
 
-Then ask your agent to "set up gh-proman": it runs `doctor`, and `project setup` adds the Priority options P0–P3 to the board after you confirm.
+Then ask your agent to "set up gh-proman": it runs `doctor` and `project setup`.
+
+- If your organisation defines Priority as an issue field (Urgent/High/…), gh-proman maps P0–P3 onto it.
+- Otherwise it adds P0–P3 to the board, after you confirm.
+
+Issues also get the org's issue type (Bug, Feature, Task) when one exists.
 
 ## Use
 
