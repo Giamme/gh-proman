@@ -106,7 +106,7 @@ def gql_issue(state, slug, issue, with_items=True):
     node = {"__typename": "Issue", "id": issue["node_id"], "number": issue["number"], "title": issue["title"],
             "body": issue.get("body", ""), "url": issue_url(slug, issue["number"]), "state": issue["state"],
             "stateReason": issue.get("state_reason"), "createdAt": issue["created_at"],
-            "updatedAt": issue["updated_at"], "author": {"login": issue["author"]},
+            "updatedAt": issue["updated_at"], "closedAt": issue.get("closed_at"), "author": {"login": issue["author"]},
             "repository": {"nameWithOwner": slug},
             "closedByPullRequestsReferences": pr_refs(state, slug, issue["number"])}
     if with_items:
@@ -169,6 +169,8 @@ def graphql(state, payload):
             nodes.append({"id": item["id"],
                           "status": {"name": fields[v["status"]]} if fields.get(v["status"]) else None,
                           "priority": {"name": fields[v["priority"]]} if fields.get(v["priority"]) else None,
+                          "estimate": ({"number": fields[v["estimate"]]}
+                                       if fields.get(v.get("estimate")) is not None else None),
                           "content": content})
         start = int(v.get("after") or 0)
         page = nodes[start:start + 50]
@@ -228,6 +230,25 @@ def graphql(state, payload):
         item.setdefault("fields", {})[field["name"]] = option["name"]
         save(state)
         out({"data": {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": item["id"]}}}})
+    if op == "GhpSetNumber":
+        p = project_by_id(state, v["project"])
+        field = next(f for f in p["fields"] if f["id"] == v["field"])
+        if field["dataType"] != "NUMBER":
+            fail("GraphQL: The field is not a number field")
+        item = next(i for i in p["items"] if i["id"] == v["item"])
+        item.setdefault("fields", {})[field["name"]] = v["number"]
+        save(state)
+        out({"data": {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": item["id"]}}}})
+    if op == "GhpCreateNumberField":
+        p = project_by_id(state, v["project"])
+        fid = next_id(state, "PVTF_")
+        p["fields"].append({"id": fid, "name": v["name"], "dataType": "NUMBER"})
+        save(state)
+        out({"data": {"createProjectV2Field": {"projectV2Field": {"id": fid}}}})
+    if op == "GhpPullCommits":
+        pr = repo(state, f"{v['owner']}/{v['repo']}").get("pulls", {}).get(str(v["number"]))
+        nodes = [{"commit": {"authoredDate": c.get("date", "2026-10-20T09:00:00Z")}} for c in (pr or {}).get("commits", [])]
+        out({"data": {"repository": {"pullRequest": {"commits": {"nodes": nodes}} if pr else None}}})
     if op == "GhpCreateField":
         p = project_by_id(state, v["project"])
         fid = next_id(state, "PVTSSF_")

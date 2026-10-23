@@ -11,7 +11,9 @@
       "I merged the PR, close whatever it finished on the board",
       "Create the tasks for this plan as issues on our GitHub project, one per package",
       "The forge run tolerated three P2 findings, open issues for them on the board",
-      "Archivia come issue le segnalazioni PLAUSIBLE della review finale"
+      "Archivia come issue le segnalazioni PLAUSIBLE della review finale",
+      "Stima quanto ci vuole per le issue in backlog del progetto",
+      "Put a time estimate on acme/app#9 on the board"
     ],
     "should_not_trigger": [
       "Create a Linear issue for this bug",
@@ -101,6 +103,36 @@
         "Either closes acme/app#7 with a closing comment that maps both criteria to evidence, or leaves it open with a comment naming the criterion without evidence",
         "acme/app#8 is not closed",
         "The handled issue's status block records the audited head (covered)"
+      ]
+    },
+    {
+      "id": 6,
+      "name": "create-asks-estimate-once",
+      "harness": "ask-and-stop",
+      "prompt": "Apri tre issue sul progetto per l'export CSV dei report: la Server Action, il pulsante nel drawer e le docs IT/EN.",
+      "files": [
+        "evals/fixtures/make_fixture.py estimate"
+      ],
+      "expected_output": "Drafts the issues, then asks once (one question for all three) whether to add time estimates before creating them.",
+      "assertions": [
+        "Asks whether to add time estimates exactly once, not once per issue",
+        "No Estimate value is written in state.json before the user answers"
+      ]
+    },
+    {
+      "id": 7,
+      "name": "estimate-lanes-not-sum",
+      "harness": "continue",
+      "prompt": "Stima la issue acme/app#9.",
+      "files": [
+        "evals/fixtures/make_fixture.py estimate"
+      ],
+      "expected_output": "Runs estimate --issue acme/app#9 --json, groups the five open items into at least two parallel lanes priced in human hands-on time, applies the plan, and reports the calibrated hours.",
+      "assertions": [
+        "Runs `estimate --issue` before writing anything",
+        "The applied plan has at least two lanes and places each of the five open items exactly once",
+        "The Estimate field of acme/app#9 in state.json is set and is 3 or less",
+        "The agent does not sum per-item implementation hours"
       ]
     }
   ]

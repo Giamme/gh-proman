@@ -313,6 +313,8 @@ DEFAULTS = {
     "autoclose": {"enabled": True, "max_closes_per_run": 3, "max_actions_per_run": 20,
                   "cross_repo": "explicit-link-only"},
     "related_owners": [],
+    "estimate": {"field": "Estimate", "scale": [0.5, 1, 2, 3, 5, 8, 13], "max_hours": 13, "min_samples": 5,
+                 "prior_factor": 1.0, "session_gap_minutes": 60, "session_lead_minutes": 15},
 }
 STATUS_ORDER = ["backlog", "ready", "in_progress", "in_review", "done"]
 CONFIG_NAME = ".github/gh-proman.json"
@@ -390,6 +392,8 @@ I18N = {
         "criteria_head": "Criteri e prove:",
         "evidence": "Prove",
         "duplicate_of": "Duplicata di {ref}.",
+        "estimate": "Stima", "lanes": "lane", "factor": "fattore", "actual": "Tempo effettivo",
+        "actual_source": {"reported": "riportato", "git": "dai commit"},
         "priority_desc": {"P0": "Bloccante: subito", "P1": "Alta: prossima iterazione",
                           "P2": "Normale", "P3": "Bassa: quando possibile"},
     },
@@ -407,6 +411,8 @@ I18N = {
         "criteria_head": "Criteria and evidence:",
         "evidence": "Evidence",
         "duplicate_of": "Duplicate of {ref}.",
+        "estimate": "Estimate", "lanes": "lanes", "factor": "factor", "actual": "Actual time",
+        "actual_source": {"reported": "reported", "git": "from commits"},
         "priority_desc": {"P0": "Blocking: now", "P1": "High: next iteration", "P2": "Normal",
                           "P3": "Low: when possible"},
     },
@@ -506,6 +512,15 @@ def render_block(state: dict, cfg: dict) -> str:
         lines.append(f"> {t['prs']}: " + ", ".join(labels))
     if state.get("criteria"):
         lines.append(f"> {t['criteria']}: {escape_ours(str(state['criteria']))}")
+    est = state.get("estimate")
+    if est:
+        lanes = len(est.get("lanes") or [])
+        lines.append(f"> {t['estimate']}: {fmt_hours(est['hours'])} h · {lanes} {t['lanes']} · "
+                     f"{t['factor']} {est.get('factor', 1)}")
+    act = state.get("actual")
+    if act:
+        lines.append(f"> {t['actual']}: {fmt_hours(act['hours'])} h "
+                     f"({t['actual_source'].get(act.get('source'), act.get('source', ''))})")
     covered = state.get("covered") or {}
     if covered:
         lines.append(f"> {t['covered']}: " + ", ".join(f"{repo}@{v.get('sha', '')[:7]}"
@@ -513,6 +528,10 @@ def render_block(state: dict, cfg: dict) -> str:
     raw = json.dumps(state, sort_keys=True, ensure_ascii=True, separators=(",", ":")).replace(">", "\\u003e")
     lines += [f"<!-- gh-proman:state {raw} -->", BLOCK_END]
     return "\n".join(lines)
+
+
+def fmt_hours(value) -> str:
+    return f"{float(value):g}"
 
 
 CHECK_RE = re.compile(r"^\s*[-*+] \[( |x|X)\] (.+?)\s*$", re.M)
@@ -536,7 +555,7 @@ def checklist(body: str) -> dict:
 
 # ---------------------------------------------------------------------------------------------- GraphQL
 
-ISSUE_FIELDS = """id number title body url state stateReason createdAt updatedAt author { login }
+ISSUE_FIELDS = """id number title body url state stateReason createdAt updatedAt closedAt author { login }
   repository { nameWithOwner }
   closedByPullRequestsReferences(first: 10, includeClosedPrs: true) {
     nodes { url number state isDraft baseRefName repository { nameWithOwner } } }"""
@@ -548,11 +567,12 @@ Q_PROJECT = """query GhpProject($owner: String!, $number: Int!) {
       ... on ProjectV2SingleSelectField { options { id name color description } } } } } } } }"""
 
 Q_ITEMS = """query GhpProjectItems($owner: String!, $number: Int!, $after: String, $status: String!,
-    $priority: String!) {
+    $priority: String!, $estimate: String!) {
   repositoryOwner(login: $owner) { ... on ProjectV2Owner { projectV2(number: $number) {
     items(first: 50, after: $after) { pageInfo { hasNextPage endCursor } nodes { id
       status: fieldValueByName(name: $status) { ... on ProjectV2ItemFieldSingleSelectValue { name } }
       priority: fieldValueByName(name: $priority) { ... on ProjectV2ItemFieldSingleSelectValue { name } }
+      estimate: fieldValueByName(name: $estimate) { ... on ProjectV2ItemFieldNumberValue { number } }
       content { __typename ... on Issue { %s } ... on PullRequest { id number title url state isDraft
         repository { nameWithOwner } } } } } } } } }""" % ISSUE_FIELDS
 
@@ -584,6 +604,10 @@ Q_MERGED = """query GhpMergedPulls($owner: String!, $repo: String!, $after: Stri
         files(first: 100) { nodes { path } }
         commits(last: 50) { nodes { commit { oid messageHeadline messageBody } } } } } } }"""
 
+Q_PR_COMMITS = """query GhpPullCommits($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) { pullRequest(number: $number) {
+    commits(first: 100) { nodes { commit { authoredDate } } } } } }"""
+
 Q_ORG_FIELDS = """query GhpOrgFields($owner: String!) {
   organization(login: $owner) { issueFields(first: 50) { nodes { __typename
     ... on IssueFieldSingleSelect { id name options { id name } } } } } }"""
@@ -600,6 +624,12 @@ M_ADD_ITEM = """mutation GhpAddItem($project: ID!, $content: ID!) {
 M_SET_FIELD = """mutation GhpSetField($project: ID!, $item: ID!, $field: ID!, $option: String!) {
   updateProjectV2ItemFieldValue(input: {projectId: $project, itemId: $item, fieldId: $field,
     value: {singleSelectOptionId: $option}}) { projectV2Item { id } } }"""
+M_SET_NUMBER = """mutation GhpSetNumber($project: ID!, $item: ID!, $field: ID!, $number: Float!) {
+  updateProjectV2ItemFieldValue(input: {projectId: $project, itemId: $item, fieldId: $field,
+    value: {number: $number}}) { projectV2Item { id } } }"""
+M_CREATE_NUMBER_FIELD = """mutation GhpCreateNumberField($project: ID!, $name: String!) {
+  createProjectV2Field(input: {projectId: $project, dataType: NUMBER, name: $name}) {
+    projectV2Field { ... on ProjectV2Field { id } } } }"""
 M_CREATE_FIELD = """mutation GhpCreateField($project: ID!, $name: String!,
     $options: [ProjectV2SingleSelectFieldOptionInput!]) {
   createProjectV2Field(input: {projectId: $project, dataType: SINGLE_SELECT, name: $name,
@@ -728,7 +758,8 @@ class Project:
             items, after = [], None
             while True:
                 data = self.gh.graphql(Q_ITEMS, owner=self.owner, number=self.number, after=after,
-                                       status=self.cfg["status_field"], priority=self.cfg["priority"]["field"])
+                                       status=self.cfg["status_field"], priority=self.cfg["priority"]["field"],
+                                       estimate=self.cfg["estimate"]["field"])
                 page = data["repositoryOwner"]["projectV2"]["items"]
                 for node in page["nodes"]:
                     content = node.get("content") or {}
@@ -736,6 +767,7 @@ class Project:
                         continue
                     items.append({"item_id": node["id"], "status": (node.get("status") or {}).get("name"),
                                   "priority": (node.get("priority") or {}).get("name"),
+                                  "estimate": (node.get("estimate") or {}).get("number"),
                                   "type": content.get("__typename"), **content})
                 if not page["pageInfo"]["hasNextPage"]:
                     break
@@ -753,6 +785,18 @@ class Project:
             raise Fail(f"project {self.label} has no field {field_name!r}")
         self.gh.graphql(M_SET_FIELD, project=self.id, item=item_id, field=field["id"],
                         option=self.option_id(field_name, option_name))
+
+    def number_field(self, field_name):
+        field = self.field(field_name)
+        if not field:
+            raise Fail(f"project {self.label} has no field {field_name!r}; run `project setup`")
+        if field.get("dataType") != "NUMBER":
+            raise Fail(f"field {field_name!r} on {self.label} is {field.get('dataType')}, not a number")
+        return field
+
+    def set_number(self, item_id, field_name, value):
+        field = self.number_field(field_name)
+        self.gh.graphql(M_SET_NUMBER, project=self.id, item=item_id, field=field["id"], number=float(value))
 
 
 STANDARD_PRIORITIES = [("urgent", "critical", "highest", "p0"), ("high", "p1"), ("medium", "normal", "p2"),
@@ -1192,7 +1236,8 @@ def pr_entry(ctx, pr_ref):
     return entry
 
 
-def status_block_upsert(ctx, ref, status=None, summary=None, prs=(), covered=None, criteria=None, retries=2):
+def status_block_upsert(ctx, ref, status=None, summary=None, prs=(), covered=None, criteria=None, estimate=None,
+                        actual=None, retries=2):
     ctx.count()
     pr_entries = [pr_entry(ctx, parse_ref(p, ref.slug, "pr")) for p in prs]
     for _ in range(retries + 1):
@@ -1214,6 +1259,10 @@ def status_block_upsert(ctx, ref, status=None, summary=None, prs=(), covered=Non
             state.setdefault("covered", {})[covered["repo"]] = {"sha": covered["sha"], "date": iso(now())}
         if criteria:
             state["criteria"] = escape_ours(str(criteria)).replace("-->", "--&gt;")
+        if estimate:
+            state["estimate"] = estimate
+        if actual:
+            state["actual"] = actual
         state["updated"] = iso(now())
         new = put_block(body, render_block(state, ctx.cfg()), ctx.cfg()["status_block_position"])
         if strip_block(new) != strip_block(body):
@@ -1619,6 +1668,15 @@ def cmd_doctor(ctx, args):
                 return not missing, detail, fix
             check("priority field", priority_field)
 
+            def estimate_field():
+                name = cfg["estimate"]["field"]
+                f = p.field(name)
+                if not f:
+                    return True, f"{name}: missing (estimates are off until `project setup` creates it)", None
+                return f.get("dataType") == "NUMBER", f"{name}: {f.get('dataType')}", \
+                    f"{name!r} must be a Number field: rename it, or point estimate.field at a Number field"
+            check("estimate field", estimate_field)
+
         if ctx.repo.slug:
             def branches():
                 names = integration_branches(ctx, ctx.repo.slug)
@@ -1708,6 +1766,14 @@ def cmd_project_setup(ctx, args):
                      "description": o.get("description") or ""} for o in existing]
             p.gh.graphql(M_UPDATE_FIELD, field=field["id"], options=keep + missing)
             report["added_options"] = [o["name"] for o in missing]
+    est_name = cfg["estimate"]["field"]
+    est_field = p.field(est_name)
+    if not est_field:
+        p.gh.graphql(M_CREATE_NUMBER_FIELD, project=p.id, name=est_name)
+        report["created"].append(est_name)
+    elif est_field.get("dataType") != "NUMBER":
+        report["estimate_warning"] = f"{est_name!r} is {est_field.get('dataType')}, not a number; estimates need a " \
+                                     "Number field (set estimate.field)"
     status = p.field(cfg["status_field"])
     names = {o["name"] for o in (status or {}).get("options") or []}
     report["missing_status"] = [v for v in cfg["status"].values() if v not in names]
@@ -2538,6 +2604,270 @@ def cmd_audit_scan(ctx, args):
     return 0
 
 
+# ---------------------------------------------------------------------------------------------- estimates
+
+def session_hours(stamps, gap_minutes, lead_minutes):
+    """Hands-on time from commit timestamps: commits closer than the gap form one session, and each session counts
+    its span plus a lead-in for the work before its first commit."""
+    stamps = sorted(set(stamps))
+    if not stamps:
+        return None
+    total, start, prev = 0.0, stamps[0], stamps[0]
+    for t in stamps[1:]:
+        if (t - prev).total_seconds() > gap_minutes * 60:
+            total += (prev - start).total_seconds() + lead_minutes * 60
+            start = t
+        prev = t
+    total += (prev - start).total_seconds() + lead_minutes * 60
+    return round(total / 3600, 2)
+
+
+def git_actual(ctx, item):
+    """Actual hours of a closed issue from the commits of its merged closing PRs (None without any)."""
+    est = ctx.cfg()["estimate"]
+    stamps = []
+    for pr in (item.get("closedByPullRequestsReferences") or {}).get("nodes", []):
+        if pr.get("state") != "MERGED":
+            continue
+        ref = parse_ref(pr["url"])
+        data = ctx.gh.graphql(Q_PR_COMMITS, owner=ref.owner, repo=ref.repo, number=ref.number)
+        node = ((data.get("repository") or {}).get("pullRequest") or {})
+        stamps += [parse_time(n["commit"]["authoredDate"]) for n in (node.get("commits") or {}).get("nodes", [])
+                   if (n.get("commit") or {}).get("authoredDate")]
+    return session_hours(stamps, est["session_gap_minutes"], est["session_lead_minutes"])
+
+
+def done_item(item):
+    return item.get("type") == "Issue" and item.get("state") == "CLOSED" and \
+        (item.get("stateReason") or "COMPLETED") == "COMPLETED"
+
+
+def history_entry(ctx, item, need_estimate=True):
+    """Estimate and actual of a closed issue, or None when one of them is missing."""
+    state = block_state(item.get("body") or "")
+    est = state.get("estimate") or {}
+    # Calibrate against the raw (uncalibrated) number, so the factor doesn't feed on itself.
+    estimate = est.get("raw") or est.get("hours") or item.get("estimate")
+    if need_estimate and not estimate:
+        return None
+    if (state.get("actual") or {}).get("hours"):
+        actual, source = float(state["actual"]["hours"]), state["actual"].get("source", "reported")
+    else:
+        actual, source = git_actual(ctx, item), "git"
+    if not actual:
+        return None
+    ref = parse_ref(item["url"])
+    return {"issue": ref.short, "title": item["title"], "estimate": float(estimate) if estimate else None,
+            "board_estimate": item.get("estimate"), "actual": actual, "actual_source": source,
+            "closed": item.get("closedAt")}
+
+
+def calibration(ctx):
+    est = ctx.cfg()["estimate"]
+    samples = [h for h in (history_entry(ctx, i) for i in ctx.project().items() if done_item(i)) if h]
+    reported = [s for s in samples if s["actual_source"] == "reported"]
+    used = reported if len(reported) >= est["min_samples"] else samples
+    out = {"samples": samples, "used": len(used), "reported": len(reported), "min_samples": est["min_samples"]}
+    if len(used) < est["min_samples"]:
+        out.update(factor=float(est["prior_factor"]), basis="prior",
+                   note=f"{len(used)} closed issue(s) with an estimate and an actual; the prior factor applies until "
+                        f"there are {est['min_samples']}")
+        return out
+    ratios = sorted(s["actual"] / s["estimate"] for s in used)
+    mid = len(ratios) // 2
+    median = ratios[mid] if len(ratios) % 2 else (ratios[mid - 1] + ratios[mid]) / 2
+    # A handful of odd issues must not swing every future estimate by more than 4x either way.
+    out.update(factor=round(min(4.0, max(0.25, median)), 2),
+               basis="reported actuals" if used is reported else "reported and git-proxy actuals")
+    return out
+
+
+def snap_hours(cfg, hours):
+    est = cfg["estimate"]
+    if hours > est["max_hours"]:
+        return float(math.ceil(hours))
+    return float(min(est["scale"], key=lambda v: abs(math.log(v / hours))))
+
+
+def board_item(ctx, ref):
+    for item in ctx.project().items():
+        if item.get("type") == "Issue" and parse_ref(item["url"]).same(ref):
+            return item
+    return None
+
+
+def estimate_view(ctx, ref, item):
+    issue = item or load_issue(ctx, ref)
+    body = issue.get("body") or ""
+    items = checklist(body)
+    anchors = []
+    src = {**source_from_text(issue["title"], body), "ref": ref}
+    for cand in candidates(ctx, src, limit=25, min_score=0.05, include_closed=True):
+        if cand["state"] != "CLOSED" or len(anchors) >= 5:
+            continue
+        closed = board_item(ctx, parse_ref(cand["url"]))
+        entry = history_entry(ctx, closed, need_estimate=False) if closed and done_item(closed) else None
+        if entry:
+            anchors.append({**entry, "similarity": cand["score"]})
+    return {"issue": ref.short, "url": issue["url"], "title": issue["title"], "state": issue["state"],
+            "status": (item or {}).get("status"), "estimate": (item or {}).get("estimate"),
+            "block_estimate": block_state(body).get("estimate"),
+            "open_items": [{"n": n, **i} for n, i in enumerate(items["open"], 1)], "done_items": len(items["done"]),
+            "anchors": anchors}
+
+
+def check_estimate(ctx, entry, cal, overwrite):
+    """Validate one plan entry and compute its hours. Returns (result, problems)."""
+    cfg = ctx.cfg()
+    ref = parse_ref(str(entry.get("issue", "")), ctx.slug, "issue")
+    if not ref:
+        return None, [f"bad issue {entry.get('issue')!r}"]
+    problems = []
+    item = board_item(ctx, ref)
+    issue = item or load_issue(ctx, ref)
+    open_items = checklist(issue.get("body") or "")["open"]
+    lanes = entry.get("lanes") or []
+    if not lanes:
+        problems.append("no lanes: group the open checklist items into lanes that can run in parallel")
+    seen = {}
+    for lane in lanes:
+        if not isinstance(lane.get("hours"), (int, float)) or lane["hours"] <= 0:
+            problems.append(f"lane {lane.get('name')!r}: hours must be a number above 0")
+        for key in lane.get("items") or []:
+            idx = None
+            if isinstance(key, int) or str(key).isdigit():
+                idx = int(key) if 1 <= int(key) <= len(open_items) else None
+            else:
+                idx = next((n for n, i in enumerate(open_items, 1) if i["text"] == str(key).strip()), None)
+            if open_items and idx is None:
+                problems.append(f"lane {lane.get('name')!r}: {key!r} is not an open checklist item")
+            elif idx is not None:
+                if idx in seen:
+                    problems.append(f"item {idx} is in both lane {seen[idx]!r} and lane {lane.get('name')!r}")
+                seen[idx] = lane.get("name")
+    missing = [n for n in range(1, len(open_items) + 1) if n not in seen]
+    if missing:
+        problems.append("open checklist items in no lane: " +
+                        "; ".join(f"{n}. {open_items[n - 1]['text']}" for n in missing))
+    extra = {}
+    for key in ("brief_hours", "integration_hours"):
+        value = entry.get(key, 0)
+        if not isinstance(value, (int, float)) or value < 0:
+            problems.append(f"{key} must be a number, 0 or more")
+        extra[key] = value if isinstance(value, (int, float)) else 0
+    if problems:
+        return {"issue": ref.short}, problems
+    raw = round(extra["brief_hours"] + sum(lane["hours"] for lane in lanes) + extra["integration_hours"], 2)
+    hours = snap_hours(cfg, raw * cal["factor"])
+    current = (item or {}).get("estimate")
+    ours = (block_state(issue.get("body") or "").get("estimate") or {}).get("hours")
+    if current is not None and float(current) != hours and not overwrite and \
+            (ours is None or float(ours) != float(current)):
+        problems.append(f"the board already says {fmt_hours(current)} h, set by someone else; ask the user, then "
+                        "pass --overwrite")
+    warnings = []
+    if len(lanes) == 1 and len(open_items) >= 4:
+        warnings.append("all items in one lane: check whether some can run in parallel")
+    if raw * cal["factor"] > cfg["estimate"]["max_hours"]:
+        warnings.append(f"over {cfg['estimate']['max_hours']} h: consider splitting it into sub-issues")
+    result = {"issue": ref.short, "raw": raw, "factor": cal["factor"], "factor_basis": cal["basis"], "hours": hours,
+              "previous": current, "warnings": warnings,
+              "_ref": ref, "_item": item, "_issue": issue,
+              "_state": {"hours": hours, "raw": raw, "factor": cal["factor"],
+                         "brief": extra["brief_hours"], "integration": extra["integration_hours"],
+                         "lanes": [{"name": str(lane.get("name") or f"lane {n}"), "items": len(lane.get("items") or []),
+                                    "hours": lane["hours"]} for n, lane in enumerate(lanes, 1)],
+                         "by": ctx.agent, "date": iso(now())}}
+    return result, problems
+
+
+def apply_estimates(ctx, plan, overwrite):
+    cfg = ctx.cfg()
+    ctx.project().number_field(cfg["estimate"]["field"])
+    cal = calibration(ctx)
+    checked = [check_estimate(ctx, entry, cal, overwrite) for entry in plan]
+    problems = {res["issue"] if res else str(i): p for i, (res, p) in enumerate(checked) if p}
+    if problems:
+        raise Refused("the estimate plan has problems; fix them and run it again (nothing was written)",
+                      {"problems": problems})
+    out = []
+    for res, _ in checked:
+        ref, item, issue = res.pop("_ref"), res.pop("_item"), res.pop("_issue")
+        state = res.pop("_state")
+        if item:
+            item_id = item["item_id"]
+        else:
+            item_id = ensure_on_board(ctx, ref, node_id=issue["id"],
+                                      project_items=(issue.get("projectItems") or {}).get("nodes", []))["item_id"]
+        if res["previous"] is None or float(res["previous"]) != res["hours"]:
+            ctx.count()
+            ctx.project().set_number(item_id, cfg["estimate"]["field"], res["hours"])
+            res["board"] = "set"
+        else:
+            res["board"] = "noop"
+        status = status_key(cfg, (item or {}).get("status"))
+        res["status_block"] = status_block_upsert(ctx, ref, status=status, estimate=state)["action"]
+        out.append(res)
+    return {"estimates": out, "calibration": {k: v for k, v in cal.items() if k != "samples"}}
+
+
+def cmd_estimate(ctx, args):
+    cfg = ctx.cfg()
+    if args.calibration:
+        emit(ctx, calibration(ctx))
+        return 0
+    if args.apply:
+        if not args.plan:
+            raise Fail("--apply needs --plan <file> (a list of {issue, brief_hours, lanes, integration_hours})")
+        raw = sys.stdin.read() if args.plan == "-" else Path(args.plan).read_text(encoding="utf-8")
+        plan = json.loads(raw)
+        plan = plan.get("estimates") if isinstance(plan, dict) else plan
+        if not isinstance(plan, list):
+            raise Fail("the plan must be a list of estimates or an object with an `estimates` list")
+        emit(ctx, apply_estimates(ctx, plan, args.overwrite))
+        return 0
+    if args.actual is not None:
+        if len(args.issue or []) != 1:
+            raise Fail("--actual needs exactly one --issue")
+        if args.actual <= 0:
+            raise Fail("--actual must be above 0 hours")
+        ref = parse_ref(args.issue[0], ctx.slug, "issue")
+        actual = {"hours": float(args.actual), "source": "reported", "date": iso(now())}
+        emit(ctx, {"issue": ref.short, "actual": actual,
+                   "status_block": status_block_upsert(ctx, ref, actual=actual)["action"]})
+        return 0
+    targets = []
+    if args.issue:
+        for text in args.issue:
+            ref = parse_ref(text, ctx.slug, "issue")
+            if not ref:
+                raise Fail(f"cannot resolve issue {text!r}")
+            targets.append((ref, board_item(ctx, ref)))
+    elif args.unestimated:
+        slug = args.repo or ctx.slug
+        for item in sorted(ctx.project().items(), key=lambda i: (i.get("repository") or {}).get("nameWithOwner", "") +
+                           f"#{i.get('number', 0):08d}"):
+            if item.get("type") != "Issue" or item.get("state") != "OPEN" or item.get("estimate") is not None:
+                continue
+            if slug and (item.get("repository") or {}).get("nameWithOwner", "").lower() != slug.lower():
+                continue
+            if args.status and status_key(cfg, item.get("status")) != args.status:
+                continue
+            targets.append((parse_ref(item["url"]), item))
+            if len(targets) >= args.limit:
+                break
+    else:
+        raise Fail("pass --issue <i> (repeatable), --unestimated, --calibration, or --apply --plan <file>")
+    cal = calibration(ctx)
+    emit(ctx, {"issues": [estimate_view(ctx, ref, item) for ref, item in targets],
+               "calibration": {k: v for k, v in cal.items() if k != "samples"},
+               "scale": cfg["estimate"]["scale"], "max_hours": cfg["estimate"]["max_hours"],
+               "next": "for each issue, group the open items into parallel lanes and price human hands-on time per "
+                       "lane (references/estimates.md); then run estimate --apply --plan <file> with "
+                       "[{issue, brief_hours, lanes: [{name, items: [<n or text>], hours}], integration_hours}]"})
+    return 0
+
+
 # ---------------------------------------------------------------------------------------------- parser
 
 def build_parser():
@@ -2570,7 +2900,7 @@ def build_parser():
     p.add_argument("--match", action="append", help="owner/repo globs for the user profile (default owner/*)")
     p.add_argument("--force", action="store_true")
 
-    p = add("project", cmd_project_setup, "set up project fields (Priority options)")
+    p = add("project", cmd_project_setup, "set up project fields (Priority options, Estimate)")
     p.add_argument("action", choices=["setup"])
 
     p = add("permalink", cmd_permalink, "SHA permalink for path[:line[-line]]")
@@ -2666,6 +2996,18 @@ def build_parser():
 
     p = add("apply", cmd_apply, "run a plan of actions (JSON file or -)")
     p.add_argument("--plan", required=True)
+
+    p = add("estimate", cmd_estimate, "estimate hands-on hours for issues, record actuals, show calibration")
+    p.add_argument("--issue", action="append", help="issue to estimate (repeatable)")
+    p.add_argument("--unestimated", action="store_true", help="open board issues of this repo with no estimate")
+    p.add_argument("--status", choices=STATUS_ORDER, help="with --unestimated: only issues in this status")
+    p.add_argument("--repo", help="with --unestimated: owner/repo (default: this repo)")
+    p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--apply", action="store_true", help="write the estimates in --plan")
+    p.add_argument("--plan", help="JSON file or - : [{issue, brief_hours, lanes, integration_hours}]")
+    p.add_argument("--overwrite", action="store_true", help="replace an Estimate someone else set")
+    p.add_argument("--actual", type=float, help="record the hands-on hours an issue really took")
+    p.add_argument("--calibration", action="store_true", help="list the closed issues the factor is computed from")
 
     p = add("audit-scan", cmd_audit_scan, "collect evidence for open board issues of this repo")
     p.add_argument("--branch", action="append")

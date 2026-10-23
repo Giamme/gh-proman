@@ -34,6 +34,10 @@ When both exist, the repo file is merged over the matched profile, key by key. `
 | `autoclose.enabled` | `true` | `false`: `close` always refuses; agents comment instead |
 | `autoclose.max_closes_per_run`, `autoclose.max_actions_per_run` | 3, 20 | Per process (`apply` plan or single command) |
 | `related_owners` | `[]` | Reserved for searching issues outside the board |
+| `estimate.field` | `Estimate` | Board Number field for hands-on hours; `project setup` creates it if missing |
+| `estimate.scale`, `estimate.max_hours` | 0.5…13 h, 13 | Values estimates snap to; above `max_hours` the result warns to split the issue |
+| `estimate.min_samples`, `estimate.prior_factor` | 5, 1.0 | Closed issues with estimate and actual needed before calibration replaces the prior factor |
+| `estimate.session_gap_minutes`, `estimate.session_lead_minutes` | 60, 15 | How commit times become hands-on hours for calibration. `references/estimates.md` has the method |
 
 ## Examples
 

@@ -776,6 +776,126 @@ class CreateTests(Case):
         self.assertIn("project setup", checks["priority field"]["fix"])
 
 
+# ---------------------------------------------------------------------------------------------- estimates
+
+class EstimateTests(Case):
+    BODY = ("## Contesto\nExport CSV dal drawer Report.\n\n## Attività\n- [ ] Server Action CSV\n"
+            "- [ ] Pulsante Esporta\n- [ ] Docs IT/EN\n- [x] Analisi\n\n## Criteri di accettazione\n"
+            "- [ ] Colonne e filtri come la tabella\n- [ ] UTF-8 con BOM\n")
+
+    def setUp(self):
+        super().setUp()
+        self.state["projects"]["o/1"]["fields"].append({"id": "F_E", "name": "Estimate", "dataType": "NUMBER"})
+        self.save()
+        self.add_issue(5, "Export CSV dal drawer Report", self.BODY)
+
+    def plan(self, entries):
+        path = self.dir / "plan.json"
+        path.write_text(json.dumps(entries))
+        return str(path)
+
+    def lanes(self, **extra):
+        return {"issue": "#5", "brief_hours": 0.25, "integration_hours": 0.5,
+                "lanes": [{"name": "server", "items": [1, 4, "UTF-8 con BOM"], "hours": 0.5},
+                          {"name": "ui", "items": ["Pulsante Esporta"], "hours": 0.25},
+                          {"name": "docs", "items": [3], "hours": 0.25}], **extra}
+
+    def closed(self, number, title, raw=None, actual=None, board=None):
+        state = {"v": 1, "status": "done"}
+        if raw:
+            state["estimate"] = {"hours": raw, "raw": raw, "factor": 1.0, "lanes": []}
+        if actual:
+            state["actual"] = {"hours": actual, "source": "reported"}
+        body = ("<!-- gh-proman:status:start -->\n<!-- gh-proman:state " + json.dumps(state) +
+                " -->\n<!-- gh-proman:status:end -->\n\n## Contesto\n" + title)
+        self.add_issue(number, title, body, state="CLOSED", status="Done")
+        if board is not None:
+            self.item(f"o/r#{number}")
+            self.state["projects"]["o/1"]["items"][-1]["fields"]["Estimate"] = board
+            self.save()
+
+    def test_apply_sums_lanes_once_and_writes_board_and_block(self):
+        res = self.cj("estimate", "--apply", "--plan", self.plan([self.lanes()]))
+        est = res["estimates"][0]
+        self.assertEqual((est["raw"], est["factor"], est["hours"]), (1.75, 1.0, 2.0))
+        self.assertEqual(self.item("o/r#5")["fields"]["Estimate"], 2.0)
+        body = self.issue(5)["body"]
+        self.assertIn("> Stima: 2 h · 3 lane · fattore 1.0", body)
+        self.assertTrue(body.endswith(self.BODY))
+        again = self.cj("estimate", "--apply", "--plan", self.plan([self.lanes()]))
+        self.assertEqual((again["estimates"][0]["board"], again["estimates"][0]["status_block"]), ("noop", "noop"))
+
+    def test_plan_must_place_every_open_item_in_exactly_one_lane(self):
+        bad = self.lanes()
+        bad["lanes"][0]["items"] = [1, 2]
+        out = self.cj("estimate", "--apply", "--plan", self.plan([bad]), expect=3)
+        problems = " ".join(out["problems"]["o/r#5"])
+        self.assertIn("item 2 is in both lane 'server' and lane 'ui'", problems)
+        self.assertIn("4. Colonne e filtri come la tabella", problems)
+        self.assertEqual(self.mutations(), [])
+
+    def test_foreign_estimate_needs_overwrite_but_our_own_does_not(self):
+        self.state["projects"]["o/1"]["items"][0]["fields"]["Estimate"] = 8
+        self.save()
+        out = self.cj("estimate", "--apply", "--plan", self.plan([self.lanes()]), expect=3)
+        self.assertIn("--overwrite", out["problems"]["o/r#5"][0])
+        self.cj("estimate", "--apply", "--plan", self.plan([self.lanes()]), "--overwrite")
+        self.assertEqual(self.item("o/r#5")["fields"]["Estimate"], 2.0)
+        cheaper = self.lanes(integration_hours=0.3, brief_hours=0.1)
+        cheaper["lanes"] = cheaper["lanes"][:1]
+        cheaper["lanes"][0]["items"] = [1, 2, 3, 4, 5]
+        self.assertEqual(self.cj("estimate", "--apply", "--plan", self.plan([cheaper]))["estimates"][0]["hours"], 1.0)
+
+    def test_calibration_uses_prior_until_enough_samples_then_median(self):
+        self.closed(20, "Uno", raw=4, actual=2)
+        self.closed(21, "Due", raw=2, actual=1)
+        self.closed(22, "Tre", raw=2, actual=2)
+        cal = self.cj("estimate", "--calibration")
+        self.assertEqual((cal["factor"], cal["basis"], len(cal["samples"])), (1.0, "prior", 3))
+        self.write_config(estimate={"min_samples": 3})
+        cal = self.cj("estimate", "--calibration")
+        self.assertEqual((cal["factor"], cal["basis"]), (0.5, "reported actuals"))
+        res = self.cj("estimate", "--apply", "--plan", self.plan([self.lanes(integration_hours=2.25)]))
+        self.assertEqual((res["estimates"][0]["raw"], res["estimates"][0]["hours"]), (3.5, 2.0))
+
+    def test_git_proxy_counts_commit_sessions_and_reported_actual_wins(self):
+        self.closed(30, "Filtro date", board=3)
+        pr = self.add_pr(31, "feat: filtro date", state="MERGED", closing=["o/r#30"], commits=["a", "b", "c"],
+                         merged_at="2026-10-20T14:00:00Z")
+        for c, date in zip(pr["commits"], ["2026-10-20T09:00:00Z", "2026-10-20T09:30:00Z", "2026-10-20T13:00:00Z"]):
+            c["date"] = date
+        self.state["repos"]["o/r"]["pulls"]["31"] = pr
+        self.save()
+        sample = self.cj("estimate", "--calibration")["samples"][0]
+        self.assertEqual((sample["estimate"], sample["actual"], sample["actual_source"]), (3.0, 1.0, "git"))
+        self.cj("estimate", "--issue", "#30", "--actual", "2")
+        sample = self.cj("estimate", "--calibration")["samples"][0]
+        self.assertEqual((sample["actual"], sample["actual_source"]), (2.0, "reported"))
+
+    def test_read_mode_lists_unestimated_issues_with_items_and_anchors(self):
+        self.closed(40, "Export CSV dal drawer Pratiche", actual=1.5)
+        self.add_issue(41, "Altro", "## Contesto\nx")
+        self.state["projects"]["o/1"]["items"][-1]["fields"]["Estimate"] = 3
+        self.save()
+        out = self.cj("estimate", "--unestimated")
+        self.assertEqual([i["issue"] for i in out["issues"]], ["o/r#5"])
+        view = out["issues"][0]
+        self.assertEqual([i["n"] for i in view["open_items"]], [1, 2, 3, 4, 5])
+        self.assertEqual(view["done_items"], 1)
+        self.assertEqual([(a["issue"], a["actual"]) for a in view["anchors"]], [("o/r#40", 1.5)])
+        self.assertEqual(self.mutations(), [])
+
+    def test_dry_run_and_project_setup(self):
+        self.cj("estimate", "--apply", "--plan", self.plan([self.lanes()]), "--dry-run")
+        self.assertEqual(self.mutations(), [])
+        self.state["projects"]["o/1"]["fields"].pop()
+        self.save()
+        out = self.cj("estimate", "--apply", "--plan", self.plan([self.lanes()]), expect=2)
+        self.assertIn("project setup", out["error"])
+        self.assertIn("Estimate", self.cj("project", "setup")["created"])
+        self.assertEqual(self.load()["projects"]["o/1"]["fields"][-1]["dataType"], "NUMBER")
+
+
 # ---------------------------------------------------------------------------------------------- audit
 
 class AuditTests(Case):

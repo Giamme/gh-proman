@@ -1,6 +1,6 @@
 ---
 name: gh-proman
-description: Use when the team tracks work on a GitHub Project board and the user wants to open, file or track an issue or ticket, plan tasks on the board, check whether an issue already exists, move an issue's status or priority, or update or close issues after a PR. Also use it right after a gh-proman hook message (it appears after `gh issue create`, `gh pr create` or `gh pr merge`, or the GitHub MCP equivalents), when asked to audit or reconcile the board with a repository ("what's already done?", "aggiorna le issue", "allinea il progetto", "which issues are stale?"), and when review findings were left open (forge `known_issues.md`, tolerated or PLAUSIBLE findings, "file the leftover findings as issues"). Keeps every agent's issues consistent and in sync: templates per type, a duplicate guard, context comments on related issues, a status block in each issue, and auto-close at high confidence when a merged PR completes an issue. Not for Linear, Jira or Trello, and not for plain git or code questions with no issue-tracking intent.
+description: Use when the team tracks work on a GitHub Project board and the user wants to open, file or track an issue or ticket, plan tasks on the board, check whether an issue already exists, move an issue's status or priority, estimate how long issues will take ("stima", "quanto ci vuole", "estimate the backlog"), or update or close issues after a PR. Also use it right after a gh-proman hook message (it appears after `gh issue create`, `gh pr create` or `gh pr merge`, or the GitHub MCP equivalents), when asked to audit or reconcile the board with a repository ("what's already done?", "aggiorna le issue", "allinea il progetto", "which issues are stale?"), and when review findings were left open (forge `known_issues.md`, tolerated or PLAUSIBLE findings, "file the leftover findings as issues"). Keeps every agent's issues consistent and in sync: templates per type, a duplicate guard, context comments on related issues, a status block in each issue, and auto-close at high confidence when a merged PR completes an issue. Not for Linear, Jira or Trello, and not for plain git or code questions with no issue-tracking intent.
 ---
 
 # gh-proman
@@ -48,6 +48,8 @@ Then run `config show` to learn the board, the language and the integration bran
 
 ## Create an issue
 
+**Ask once whether to estimate.** Before creating (one issue or a whole batch), ask the user in one line whether they want a time estimate on the issues you're about to open. Ask once per request, not once per issue, and skip the question when they already said so ("con stima", "no estimates"). If yes, estimate each issue right after `create` (see "Estimate issues").
+
 1. Pick the type (`bug`, `feature`, `chore`) and read `assets/templates/<language>/<type>.md`. Fill every section and drop the `<!-- hints -->`. `references/issue-writing.md` covers:
    - titles, including the prefix `create` adds: `[ID · Pn]` for planned tasks, `[Pn]` otherwise;
    - how concrete the checklists should be;
@@ -60,7 +62,25 @@ Then run `config show` to learn the board, the language and the integration bran
    - sets the priority, on the org issue field or the board field, wherever Priority lives.
 5. **Duplicate guard.** If `create` exits 3 with candidates, show them to the user. Offer to comment on or extend the existing issue instead (`comment --event issue-related`, or ask the owner). Pass `--confirm-new` only after the user says it really is new.
 
-Several related tasks: create a parent issue and its children with `--parent`, so the board shows sub-issue progress.
+Several related tasks: create a parent issue and its children with `--parent`, so the board shows sub-issue progress. When estimating, estimate the children, not the parent.
+
+## Estimate issues
+
+An estimate is **hands-on human time in hours**: briefing, steering, reviewing, verifying. It is not the agents' working time, and not checklist items done one after the other. Read `references/estimates.md` before the first estimate in a session.
+
+1. Run `estimate --issue <i> [--issue …] --json`, or `estimate --unestimated [--status backlog] --json` for "stima le issue in backlog". For each issue it returns:
+   - the open checklist items, numbered;
+   - the current Estimate;
+   - `anchors`: similar closed issues with the hours they actually took;
+   - the team's calibration factor.
+2. For each issue, start from the closest anchor. Group the open items into lanes that agents can run in parallel, and price each lane in human time. Add a brief and an integration cost once per issue. Never sum per-item build time.
+3. Write the plan (`[{issue, brief_hours, lanes: [{name, items, hours}], integration_hours}]`) and run `estimate --apply --plan <f>`. The script:
+   - refuses a plan that leaves an open item out or puts one in two lanes;
+   - applies the factor, snaps to the scale;
+   - writes the board's `Estimate` field and a line in the status block.
+4. For several issues, show the user one table first (issue, lanes, raw, calibrated hours), then apply. Over 13 h, suggest splitting the issue into sub-issues.
+
+When the user says how long an issue really took, record it with `estimate --issue <i> --actual <hours>`. Don't ask for it after every close: commit times on the merged PRs give a rougher figure on their own. `estimate --calibration` shows what the factor is based on.
 
 ## Sync (after a hook message, or whenever you created/merged something without one)
 
@@ -142,6 +162,8 @@ When forge was started with `--file-issues auto`, file without asking: run with 
 | `config init`, `project setup` (show `--dry-run`) | `doctor`, `config show`, `candidates`, `sync`, `audit-scan`, any `--dry-run` |
 | `create --confirm-new` past the duplicate guard | `create` when the guard passes and the user asked for the issue |
 | `findings --apply` (once, after showing the drafts) | `findings` drafts; `findings --apply` when forge ran with `--file-issues auto` |
+| whether to estimate the issues you're about to create (once per request) | `estimate` drafts and `--calibration`; `estimate --apply` once the user wants estimates; `--actual` the user gave you |
+| `estimate --overwrite` of an Estimate someone set by hand | |
 | closing during an audit (once, for the whole list) | sync comments, status blocks, Status moves |
 | closing an issue someone else opened and is actively discussing | closing after a merge when the rubric is met (hook-driven) |
 | `--allow-backward`, editing anyone's issue text | |
@@ -156,6 +178,7 @@ When forge was started with `--file-issues auto`, file without asking: run with 
 - Creating a new issue when one already covers the work. Extend it with a comment instead.
 - Branch permalinks (`/blob/main/...`). Use `permalink`.
 - Retrying a refused `close` with raw `gh issue close`.
+- Estimating by adding up per-item hours, or counting the time agents spend working. Price human hands-on time per parallel lane, starting from the anchors.
 
 ## References
 
@@ -165,3 +188,4 @@ When forge was started with `--file-issues auto`, file without asking: run with 
 - `references/rubric.md`: auto-close rubric, duplicates, per-run limits, what the script enforces. Read it before any close.
 - `references/linking.md`: Refs/Closes, stacked PRs, integration branches, how links are detected.
 - `references/findings.md`: filing forge review findings: sources, fingerprints, grouping, examples.
+- `references/estimates.md`: estimating hands-on hours: lanes, anchors, calibration from actuals, plan format.

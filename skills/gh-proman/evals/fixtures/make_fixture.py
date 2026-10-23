@@ -33,7 +33,8 @@ def board():
     return {"viewer": "me", "seq": 1000, "clock": 0, "now": "2026-10-21T10:00:00Z",
             "repos": {"acme/app": {"default_branch": "main", "branches": ["main", "dev"], "issues": {}, "pulls": {},
                                    "compare": {}, "commits": {}}},
-            "projects": {"acme/1": {"id": "PVT_1", "title": "Acme", "fields": [status, priority], "items": []}}}
+            "projects": {"acme/1": {"id": "PVT_1", "title": "Acme", "items": [],
+                                    "fields": [status, priority, {"id": "F_E", "name": "Estimate", "dataType": "NUMBER"}]}}}
 
 
 def issue(state, n, title, body, status="Backlog", author="me", created="2026-10-01T09:00:00Z"):
@@ -89,6 +90,11 @@ def main():
         git(root, "add", "-A")
         git(root, "commit", "-q", "-m", "feat(reports): export CSV con date italiane\n\nCloses acme/app#7")
         git(root, "update-ref", "refs/remotes/origin/dev", "HEAD")
+    if scenario == "estimate":
+        issue(state, 9, "Esporta i report in CSV dal drawer Report",
+              "## Contesto\nGli analisti copiano le tabelle a mano.\n\n## Attività\n- [ ] Server Action che genera il CSV\n"
+              "- [ ] Pulsante \"Esporta CSV\" nel drawer Report\n- [ ] Docs IT/EN aggiornate\n\n"
+              "## Criteri di accettazione\n- [ ] Colonne e filtri come la tabella visibile\n- [ ] UTF-8 con BOM per Excel\n")
     (out / "state.json").write_text(json.dumps(state, indent=1))
     (out / "env.sh").write_text(
         f'export PATH="{FAKE_DIR}:$PATH"\nexport GH_FAKE_STATE="{out / "state.json"}"\n'
