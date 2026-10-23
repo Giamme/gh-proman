@@ -74,10 +74,10 @@ gh-proman does nothing in a repository until a config applies, and the hook stay
 {
   "profiles": [
     {
-      "match": ["collitude/*"],
+      "match": ["orgname/*"],
       "language": "it",
-      "project": { "owner": "collitude", "number": 1 },
-      "integration_branches": ["dev", "dev-deb", "@default"]
+      "project": { "owner": "username", "number": 1 },
+      "integration_branches": ["dev", "stage", "@default"]
     }
   ]
 }
